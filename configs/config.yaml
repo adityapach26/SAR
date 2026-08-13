@@ -1,0 +1,38 @@
+dataset:
+  path: ""
+  image_size: 256
+  val_split: 0.1
+  test_split: 0.1
+  random_seed: 42
+
+input_channels:
+  mode: "rgb"
+  texture_kernel_size: 3
+  num_channels: 3
+
+model:
+  generator:
+    base_channels: 64
+  discriminator:
+    base_channels: 64
+
+train:
+  batch_size: 16
+  num_epochs: 50
+  learning_rate: 2e-4
+  beta1: 0.5
+  beta2: 0.999
+
+loss:
+  lambda_gan: 1.0
+  lambda_l1: 100.0
+  lambda_perceptual: 0.0
+  lambda_semantic: 0.0
+
+ensemble:
+  num_members: 3
+  seeds: [1, 2, 3]
+
+detection:
+  dataset_path: ""
+  num_classes: 10
