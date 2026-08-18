@@ -1,5 +1,5 @@
 dataset:
-  path: ""
+  path: "data/dummy_data"
   image_size: 256
   val_split: 0.1
   test_split: 0.1
@@ -22,12 +22,18 @@ train:
   learning_rate: 2e-4
   beta1: 0.5
   beta2: 0.999
+  log_every_n_batches: 20
+  save_every_n_epochs: 5
+
+paths:
+  checkpoint_dir: "checkpoints"
+  output_dir: "outputs"
 
 loss:
   lambda_gan: 1.0
   lambda_l1: 100.0
-  lambda_perceptual: 0.0
-  lambda_semantic: 0.0
+  lambda_perceptual: 10.0
+  lambda_semantic: 1.0
 
 ensemble:
   num_members: 3
