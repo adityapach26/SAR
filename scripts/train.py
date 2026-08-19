@@ -47,7 +47,7 @@ def make_loaders(cfg):
     num_scenes = count_scenes(cfg.dataset.path)
     if num_scenes == 0:
         raise SystemExit(f"no s1_* scenes found under {cfg.dataset.path!r}")
-    pairs = build_pairs(cfg.dataset.path, num_scenes=num_scenes)
+    pairs, _mismatches = build_pairs(cfg.dataset.path, num_scenes=num_scenes)
     if not pairs:
         raise SystemExit(f"no matching image pairs under {cfg.dataset.path!r}")
     num_channels = cfg.input_channels.num_channels

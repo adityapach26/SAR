@@ -1,5 +1,5 @@
 dataset:
-  path: "data/dummy_data"
+  path: "/content/drive/MyDrive/SAR_Project/dataset/v_2/agri"
   image_size: 256
   val_split: 0.1
   test_split: 0.1
