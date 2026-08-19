@@ -1,3 +1,12 @@
+====================================================
+ENSEMBLE TRAINING RUN RECORD  (generated pre-launch)
+  timestamp : 2026-08-20_0027
+  git commit: a785fdbe82a53395ba63112bd7e880bfc0f74d2c
+  branch    : main
+  status    : 4 file(s) modified
+====================================================
+
+===== FULL RESOLVED CONFIG (configs/config.yaml) =====
 dataset:
   path: "/content/drive/MyDrive/SAR_Project/dataset/v_2/agri"
   image_size: 256
@@ -46,3 +55,6 @@ ensemble:
 detection:
   dataset_path: ""
   num_classes: 10
+===== LOSS GATE (verify_loss_config) =====
+verify_loss_config: lambda_perceptual=10.0  lambda_semantic=1.0
+OK: both auxiliary losses are enabled.

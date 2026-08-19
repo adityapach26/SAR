@@ -1,16 +1,28 @@
 """Pix2Pix training loop for the dual-branch SAR-to-RGB generator.
 
+The training logic lives in :func:`train_generator`, which is self-contained:
+it seeds RNG, builds *fresh* Generator/Discriminator + optimizers, trains for
+``config.train.num_epochs`` epochs, and saves the final generator weights to
+``output_checkpoint_path``. It returns the trained generator so callers can
+e.g. train an ensemble (Phase 4).
+
+``train_split`` is optional. When omitted, training uses the default split
+derived from ``config`` (the whole dataset). When provided, it *replaces* that
+default with a caller-supplied split (a DataLoader, or an explicit list of
+``(sar_path, rgb_path)`` pairs) — which enables split-based diversity across
+runs, not just seed-based diversity.
+
 Standard GAN objective:
-  * Discriminator is trained to tell real vs. fake (fake) (SAR, RGB) pairs apart
-    via BCELogitsLoss over the PatchGAN map.
+  * Discriminator is trained to tell real vs. fake (SAR, RGB) pairs apart via
+    BCELogitsLoss over the PatchGAN map.
   * Generator is trained to fool the discriminator (adversarial term) and to
-    match the ground-truth RGB with an L1 loss weighted by ``lambda_l1``.
-      G_loss = lambda_gan * BCE(D(G(sar)), real) + lambda_l1 * |G(sar) - rgb|_1
+    match the ground-truth RGB with an L1 loss weighted by ``lambda_l1``:
+      G_loss = lambda_gan*BCE(D(G(sar)), real) + lambda_l1*|G(sar) - rgb|_1
 
 All hyperparameters are read from configs/config.yaml. The adversarial (real)
 label is a ones-tensor matching the discriminator's patch-map shape.
 
-Run:  python scripts/train.py [--epochs N] [--device cpu|cuda]
+Run:  python scripts/train.py [--seed N] [--epochs N] [--output PATH]
 """
 
 from __future__ import annotations
@@ -37,27 +49,30 @@ from losses.semantic_loss import SemanticLoss  # noqa: E402
 
 
 def count_scenes(dataset_path: Path) -> int:
-    """Number of SEN1-2 scenes (max s1_i index + 1)."""
+    """Number of legacy SEN1-2 scenes (max s1_i index + 1). 0 for the agri layout."""
     indices = [int(d.name[3:]) for d in Path(dataset_path).iterdir()
                if d.is_dir() and d.name.startswith("s1_")]
     return (max(indices) + 1) if indices else 0
 
 
-def make_loaders(cfg):
-    num_scenes = count_scenes(cfg.dataset.path)
-    if num_scenes == 0:
-        raise SystemExit(f"no s1_* scenes found under {cfg.dataset.path!r}")
-    pairs, _mismatches = build_pairs(cfg.dataset.path, num_scenes=num_scenes)
-    if not pairs:
-        raise SystemExit(f"no matching image pairs under {cfg.dataset.path!r}")
+def _build_loader(cfg, pairs, shuffle=True):
+    """Wrap an explicit pair list in a parallel, pinned DataLoader."""
     num_channels = cfg.input_channels.num_channels
     ds = SEN12Dataset(pairs, num_channels=num_channels)
     # Parallel background workers keep image loading off the GPU/math critical
     # path; pin_memory makes host->device copies faster on CUDA systems.
-    loader = DataLoader(ds, batch_size=cfg.train.batch_size, shuffle=True,
+    loader = DataLoader(ds, batch_size=cfg.train.batch_size, shuffle=shuffle,
                         num_workers=cfg.train.num_workers, pin_memory=True,
                         drop_last=False)
     return loader, len(ds)
+
+
+def make_loaders(cfg):
+    """Default split from config: all matching pairs under cfg.dataset.path."""
+    pairs, _mismatches = build_pairs(cfg.dataset.path, num_scenes=count_scenes(cfg.dataset.path))
+    if not pairs:
+        raise SystemExit(f"no matching image pairs under {cfg.dataset.path!r}")
+    return _build_loader(cfg, pairs, shuffle=True)
 
 
 def save_checkpoint(cfg, epoch, gen, disc, opt_g, opt_d, path):
@@ -71,49 +86,75 @@ def save_checkpoint(cfg, epoch, gen, disc, opt_g, opt_d, path):
     print(f"[save] checkpoint -> {path}")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Pix2Pix training (dual-branch).")
-    ap.add_argument("--epochs", type=int, default=None,
-                    help="override train.num_epochs from config (for testing)")
-    ap.add_argument("--device", default=None, help="cpu | cuda (default: auto)")
-    args = ap.parse_args()
+def train_generator(seed, config, output_checkpoint_path, train_split=None):
+    """Train a fresh SAR-to-RGB generator and save its final weights.
 
-    cfg = load_config(str(ROOT / "configs" / "config.yaml"))
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    torch.manual_seed(cfg.dataset.random_seed)
+    Parameters
+    ----------
+    seed : int
+        RNG seed. ``torch.manual_seed(seed)`` is called at the very start.
+    config : Config
+        Loaded config object (attribute access): train/loss/model/paths keys.
+    output_checkpoint_path : str | Path
+        Where the final generator weights will be saved (state_dict only).
+    train_split : DataLoader | list[tuple[str, str]] | None, optional
+        Optional *replacement* for the default config-derived split:
+          * None              -> use config's default split (whole dataset)
+          * list of pairs     -> train on exactly those (sar_path, rgb_path) pairs
+          * DataLoader        -> train on that loader directly
+        This supports split-based diversity across runs (not just seed-based).
 
-    n_epochs = args.epochs or cfg.train.num_epochs
-    base_g = cfg.model.generator.base_channels
-    base_d = cfg.model.discriminator.base_channels
-    sar_channels = cfg.input_channels.num_channels
+    Returns
+    -------
+    nn.Module
+        The trained generator.
+    """
     # PyYAML resolves the bare exponent "2e-4" to a string; coerce to float.
-    lr = float(cfg.train.learning_rate)
-    betas = (cfg.train.beta1, cfg.train.beta2)
-    lambda_gan, lambda_l1 = cfg.loss.lambda_gan, cfg.loss.lambda_l1
-    lambda_perc = cfg.loss.lambda_perceptual
-    lambda_sem = cfg.loss.lambda_semantic
-    log_every = cfg.train.log_every_n_batches
-    save_every = cfg.train.save_every_n_epochs
-    ckpt_dir = Path(cfg.paths.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    lr = float(config.train.learning_rate)
+    betas = (config.train.beta1, config.train.beta2)
+    lambda_gan, lambda_l1 = config.loss.lambda_gan, config.loss.lambda_l1
+    lambda_perc = config.loss.lambda_perceptual
+    lambda_sem = config.loss.lambda_semantic
+    n_epochs = config.train.num_epochs
+    log_every = config.train.log_every_n_batches
+    save_every = config.train.save_every_n_epochs
 
-    gen = Generator(sar_channels=sar_channels, rgb_channels=3, base_channels=base_g).to(device)
+    torch.manual_seed(seed)  # (1) deterministic RNG for this run
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # (2) fresh Generator / Discriminator
+    sar_channels = config.input_channels.num_channels
+    gen = Generator(sar_channels=sar_channels, rgb_channels=3,
+                    base_channels=config.model.generator.base_channels).to(device)
     disc = PatchGANDiscriminator(sar_channels=sar_channels, rgb_channels=3,
-                                 base_channels=base_d).to(device)
+                                 base_channels=config.model.discriminator.base_channels).to(device)
+    print(f"seed={seed}  device={device}  epochs={n_epochs}  batch_size={config.train.batch_size}")
 
-    # Only build the (heavy, frozen) auxiliary losses when they are enabled.
+    # (3) resolve the data split (train_split overrides the config default)
+    if train_split is None:
+        loader, n_samples = make_loaders(config)
+        split_desc = "config default"
+    elif isinstance(train_split, DataLoader):
+        loader = train_split
+        n_samples = len(loader.dataset)
+        split_desc = "provided DataLoader"
+    else:
+        pairs = list(train_split)
+        loader, n_samples = _build_loader(config, pairs, shuffle=True)
+        split_desc = f"provided split ({len(pairs)} pairs)"
+    print(f"  split: {split_desc}  samples={n_samples}  batches/epoch={len(loader)}")
+
+    # Auxiliary losses are built only when enabled (heavy + frozen).
     perceptual = PerceptualLoss().to(device) if lambda_perc > 0 else None
     semantic = SemanticLoss().to(device) if lambda_sem > 0 else None
 
     opt_g = torch.optim.Adam(gen.parameters(), lr=lr, betas=betas)
     opt_d = torch.optim.Adam(disc.parameters(), lr=lr, betas=betas)
-
     bce = nn.BCEWithLogitsLoss()
     l1 = nn.L1Loss()
 
-    loader, n_samples = make_loaders(cfg)
-    print(f"device={device}  samples={n_samples}  scenes={count_scenes(cfg.dataset.path)}  "
-          f"epochs={n_epochs}  batch_size={cfg.train.batch_size}\n")
+    ckpt_dir = Path(config.paths.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, n_epochs + 1):
         gen.train()
@@ -181,9 +222,36 @@ def main() -> int:
 
         if epoch % save_every == 0 or epoch == n_epochs:
             path = ckpt_dir / f"epoch_{epoch:04d}.pt"
-            save_checkpoint(cfg, epoch, gen, disc, opt_g, opt_d, path)
+            save_checkpoint(config, epoch, gen, disc, opt_g, opt_d, path)
 
-    print("\nTraining complete.")
+    # Save the final generator weights to the requested path.
+    out = Path(output_checkpoint_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(gen.state_dict(), out)
+    print(f"[save] final generator weights -> {out}")
+
+    return gen
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Pix2Pix training (dual-branch).")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="RNG seed (default: dataset.random_seed from config)")
+    ap.add_argument("--epochs", type=int, default=None,
+                    help="override train.num_epochs from config (for testing)")
+    ap.add_argument("--output", default=None,
+                    help="final generator weights path (default: <checkpoint_dir>/generator_final.pt)")
+    args = ap.parse_args()
+
+    cfg = load_config(str(ROOT / "configs" / "config.yaml"))
+    if args.seed is not None:
+        cfg.dataset.random_seed = args.seed
+    if args.epochs is not None:
+        cfg.train.num_epochs = args.epochs
+    output = args.output or str(Path(cfg.paths.checkpoint_dir) / "generator_final.pt")
+
+    train_generator(seed=cfg.dataset.random_seed, config=cfg,
+                    output_checkpoint_path=output)
     return 0
 
 
