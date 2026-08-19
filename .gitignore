@@ -5,4 +5,7 @@ checkpoints/
 outputs/
 *.pt
 *.pth
-data/
+data/dummy_data/
+data/*.png
+data/*.jpg
+data/*.tif
