@@ -121,6 +121,3 @@ if __name__ == "__main__":
     print(f"Figure saved to {output_fig_path}")
     # Optionally show the plot (uncomment if running interactively)
     # plt.show()
-
-
-    

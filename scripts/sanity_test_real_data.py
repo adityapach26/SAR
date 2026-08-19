@@ -50,6 +50,8 @@ BATCH_SIZE = 8           # 160 // 8 = 20 batches
 TARGET_PAIRS = 160       # timed sample target
 WARMUP_BATCHES = 2       # untimed throwaway batches before the timer
 FULL_DATASET_SIZE = 4000
+PIN_MEMORY = True        # page-lock host tensors for faster GPU copies
+PROFILE_SAMPLES = 4      # how many samples to use for the loading-stage profile
 
 
 def param_device(module) -> str:
@@ -130,13 +132,35 @@ def main() -> int:
         return 1
 
     num_channels = cfg.input_channels.num_channels
+    num_workers = cfg.train.num_workers
     ds = SEN12Dataset(pairs, num_channels=num_channels)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
+                        num_workers=num_workers, pin_memory=PIN_MEMORY)
     n_batches = len(loader)
     # Warmup uses its own (throwaway) iterator passes, so the timed epoch below
     # still covers all n_batches of the real loader -> maximal timed sample.
-    print(f"Using {len(ds)} pairs, batch_size={BATCH_SIZE} -> {n_batches} batches "
+    print(f"Using {len(ds)} pairs, batch_size={BATCH_SIZE} num_workers={num_workers} "
+          f"pin_memory={PIN_MEMORY} -> {n_batches} batches "
           f"(plus {WARMUP_BATCHES} warmup passes, untimed; all {n_batches} timed)\n")
+
+    # --- Image-loading stage profile: PIL open vs. multichannel (uniform_filter).
+    # Run in-process (num_workers=0 path) so timings land in one process.
+    prof_ds = SEN12Dataset(pairs[:PROFILE_SAMPLES], num_channels=num_channels, profile=True)
+    prof_ds.reset_profile()
+    for i in range(len(prof_ds)):
+        prof_ds[i]  # force load + multichannel
+    p = prof_ds.profile_times
+    n_p = float(len(prof_ds))
+    print("-- loading stage profile (per-sample avg, in-process) --")
+    print(f"  PIL Image.open (SAR)      : {p['pil_sar'] / n_p:.4f} s")
+    print(f"  multichannel (uniform_ft) : {p['multichannel'] / n_p:.4f} s")
+    print(f"  PIL Image.open (RGB)      : {p['pil_rgb'] / n_p:.4f} s")
+    print(f"  loading total (per-sample): {(p['pil_sar'] + p['multichannel'] + p['pil_rgb']) / n_p:.4f} s")
+    if p['multichannel'] > p['pil_sar']:
+        print("  -> build_multichannel_input (uniform_filter) is the bottleneck in loading")
+    else:
+        print("  -> PIL Image.open (disk/decoding) is the bottleneck in loading")
+    print()
 
     # --- Models + optimizers + losses (all per config). ---
     gen = Generator(sar_channels=num_channels, rgb_channels=3,

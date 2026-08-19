@@ -52,8 +52,11 @@ def make_loaders(cfg):
         raise SystemExit(f"no matching image pairs under {cfg.dataset.path!r}")
     num_channels = cfg.input_channels.num_channels
     ds = SEN12Dataset(pairs, num_channels=num_channels)
+    # Parallel background workers keep image loading off the GPU/math critical
+    # path; pin_memory makes host->device copies faster on CUDA systems.
     loader = DataLoader(ds, batch_size=cfg.train.batch_size, shuffle=True,
-                        num_workers=0, drop_last=False)
+                        num_workers=cfg.train.num_workers, pin_memory=True,
+                        drop_last=False)
     return loader, len(ds)
 
 

@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 from PIL import Image
 import torch
@@ -92,7 +93,7 @@ class SEN12Dataset(Dataset):
         rgb_tensor: Tensor of shape (3, H, W)
     Both tensors are normalized to [-1, 1] to match Tanh output range.
     """
-    def __init__(self, pairs, num_channels=1):
+    def __init__(self, pairs, num_channels=1, profile=False):
         """
         Parameters
         ----------
@@ -100,11 +101,21 @@ class SEN12Dataset(Dataset):
             List of (sar_path, rgb_path) from build_pairs.
         num_channels : int, optional
             Number of channels for SAR input (1 or 3). Default: 1.
+        profile : bool, optional
+            When True, accumulate per-stage wall-times in ``self.profile_times``
+            (does NOT alter the returned tensors — only adds timing).
         """
         self.pairs = pairs
         self.num_channels = num_channels
+        self.profile = bool(profile)
+        self.profile_times = {"pil_sar": 0.0, "multichannel": 0.0, "pil_rgb": 0.0}
         if self.num_channels not in (1, 3):
             raise ValueError("num_channels must be 1 or 3")
+
+    def reset_profile(self):
+        """Zero the accumulated profile times."""
+        for k in self.profile_times:
+            self.profile_times[k] = 0.0
 
     def __len__(self):
         return len(self.pairs)
@@ -113,8 +124,11 @@ class SEN12Dataset(Dataset):
         sar_path, rgb_path = self.pairs[idx]
 
         # Load SAR image (grayscale)
+        _t = time.time()
         sar_img = Image.open(sar_path).convert('L')  # Ensure single channel
         sar_np = np.array(sar_img, dtype=np.uint8)  # shape (H, W)
+        if self.profile:
+            self.profile_times["pil_sar"] += time.time() - _t
 
         if self.num_channels == 1:
             # Convert to tensor and normalize to [-1, 1]
@@ -123,13 +137,19 @@ class SEN12Dataset(Dataset):
             sar_tensor = sar_tensor.unsqueeze(0)  # shape (1, H, W)
         else:  # num_channels == 3
             # Use build_multichannel_input to get (3, H, W) in [0, 1]
+            _t = time.time()
             sar_np_float = build_multichannel_input(sar_np, kernel_size=7)  # shape (3, H, W), float32 in [0,1]
+            if self.profile:
+                self.profile_times["multichannel"] += time.time() - _t
             sar_tensor = torch.from_numpy(sar_np_float)  # shape (3, H, W)
             sar_tensor = sar_tensor * 2.0 - 1.0  # [-1, 1]
 
         # Load RGB image
+        _t = time.time()
         rgb_img = Image.open(rgb_path).convert('RGB')  # Ensure 3 channels
         rgb_np = np.array(rgb_img, dtype=np.uint8)  # shape (H, W, 3)
+        if self.profile:
+            self.profile_times["pil_rgb"] += time.time() - _t
         # Convert to tensor (C, H, W) and normalize to [-1, 1]
         rgb_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1).float() / 255.0  # [0, 1]
         rgb_tensor = rgb_tensor * 2.0 - 1.0  # [-1, 1]
