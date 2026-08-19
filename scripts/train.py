@@ -28,10 +28,12 @@ Run:  python scripts/train.py [--seed N] [--epochs N] [--output PATH]
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -119,7 +121,11 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
     log_every = config.train.log_every_n_batches
     save_every = config.train.save_every_n_epochs
 
-    torch.manual_seed(seed)  # (1) deterministic RNG for this run
+    # (1) deterministic RNG for this run — torch, numpy, and python all seeded
+    # so data loaders / splits / weight init are reproducible from the seed.
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # (2) fresh Generator / Discriminator

@@ -27,8 +27,8 @@ train:
   save_every_n_epochs: 5
 
 paths:
-  checkpoint_dir: "checkpoints"
-  output_dir: "outputs"
+  checkpoint_dir: "/content/drive/MyDrive/SAR_Project/checkpoints"
+  output_dir: "/content/drive/MyDrive/SAR_Project/outputs"
 
 loss:
   lambda_gan: 1.0
