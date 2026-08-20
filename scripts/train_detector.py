@@ -69,8 +69,7 @@ def _build_faster_rcnn(num_classes: int, device: torch.device) -> nn.Module:
 
 
 def _collate(batch):
-    """Stack images, keep each target dict separate (detection collate)."""
-    images = torch.stack([b[0] for b in batch])
+    images = [b[0] for b in batch]
     targets = [b[1] for b in batch]
     return images, targets
 
