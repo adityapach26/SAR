@@ -22,7 +22,7 @@ Standard GAN objective:
 All hyperparameters are read from configs/config.yaml. The adversarial (real)
 label is a ones-tensor matching the discriminator's patch-map shape.
 
-Run:  python scripts/train.py [--seed N] [--epochs N] [--output PATH]
+Run:  python scripts/train.py [--seed N] [--epochs N] [--output PATH] [--local-copy]
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from utils.config_loader import load_config        # noqa: E402
 from data.dataset import build_pairs, SEN12Dataset, split_pairs  # noqa: E402
 from losses.perceptual_loss import PerceptualLoss  # noqa: E402
 from losses.semantic_loss import SemanticLoss  # noqa: E402
+from scripts.copy_dataset_local import local_dataset_dir  # noqa: E402
 
 
 def count_scenes(dataset_path: Path) -> int:
@@ -297,6 +298,10 @@ def main() -> int:
                     help="override train.num_epochs from config (for testing)")
     ap.add_argument("--output", default=None,
                     help="final generator weights path (default: <checkpoint_dir>/generator_final.pt)")
+    ap.add_argument("--local-copy", action="store_true",
+                    help="read training data from the local dataset copy "
+                         "(dataset.local_dataset_path) instead of dataset.path (Drive). "
+                         "Checkpoints still save to checkpoint_dir (Drive).")
     args = ap.parse_args()
 
     cfg = load_config(str(ROOT / "configs" / "config.yaml"))
@@ -305,6 +310,10 @@ def main() -> int:
     if args.epochs is not None:
         cfg.train.num_epochs = args.epochs
     output = args.output or str(Path(cfg.paths.checkpoint_dir) / "generator_final.pt")
+    if args.local_copy:
+        cfg.dataset.path = local_dataset_dir(cfg)
+        print(f"  reading data from local copy: {cfg.dataset.path!r} "
+              f"(checkpoints still -> {cfg.paths.checkpoint_dir})")
 
     train_generator(seed=cfg.dataset.random_seed, config=cfg,
                     output_checkpoint_path=output)

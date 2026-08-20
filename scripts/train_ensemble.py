@@ -20,7 +20,7 @@ Local sanity check (tiny dummy data):
     python scripts/train_ensemble.py --dataset-path data/_tiny_dummy --epochs 1
 
 Run:
-    python scripts/train_ensemble.py [--dataset-path PATH] [--epochs N] [--mode seed|seed_and_split]
+    python scripts/train_ensemble.py [--dataset-path PATH] [--epochs N] [--mode seed|seed_and_split] [--local-copy]
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
 from utils.config_loader import load_config            # noqa: E402
 from data.dataset import build_pairs                    # noqa: E402
 from scripts.train import train_generator, count_scenes  # noqa: E402
+from scripts.copy_dataset_local import local_dataset_dir  # noqa: E402
 
 
 def make_seed_split(seed, config):
@@ -78,9 +79,17 @@ def main() -> int:
                     help="override train.num_epochs (for a quick local sanity check)")
     ap.add_argument("--mode", default=None,
                     help="override ensemble.diversity_mode: seed | seed_and_split")
+    ap.add_argument("--local-copy", action="store_true",
+                    help="read training data from the local dataset copy "
+                         "(dataset.local_dataset_path) instead of dataset.path (Drive). "
+                         "Checkpoints still save to checkpoint_dir (Drive).")
     args = ap.parse_args()
 
     cfg = load_config(str(ROOT / "configs" / "config.yaml"))
+    if args.local_copy:
+        cfg.dataset.path = local_dataset_dir(cfg)
+        print(f"  reading data from local copy: {cfg.dataset.path!r} "
+              f"(checkpoints still -> {cfg.paths.checkpoint_dir})")
     if args.dataset_path:
         cfg.dataset.path = args.dataset_path
     if args.epochs is not None:
