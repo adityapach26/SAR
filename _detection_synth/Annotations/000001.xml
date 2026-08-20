@@ -1,0 +1,6 @@
+<annotation><filename>000001.jpg</filename><size><width>512</width><height>512</height></size>
+<object><name>ship</name><rotated_bndbox>
+<x1>80</x1><y1>200</y1><x2>160</x2><y2>205</y2><x3>155</x3><y3>240</y3><x4>90</x4><y4>230</y4></rotated_bndbox></object>
+<object><name>ship</name><rotated_bndbox>
+<x1>380</x1><y1>300</y1><x2>470</x2><y2>302</y2><x3>465</x3><y3>330</y3><x4>385</x4><y4>328</y4></rotated_bndbox></object>
+</annotation>

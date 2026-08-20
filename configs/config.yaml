@@ -45,5 +45,5 @@ ensemble:
   diversity_mode: "seed"
 
 detection:
-  dataset_path: ""
-  num_classes: 10
+  dataset_path: "/content/drive/MyDrive/SAR_Project/dataset/ssdd/voc_style"
+  num_classes: 2
