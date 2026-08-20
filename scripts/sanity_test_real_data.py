@@ -1,10 +1,12 @@
 """Quick end-to-end sanity run on the real dataset (or a tiny subset).
 
-Loads the first 160 SAR/RGB pairs from the real dataset path (configs/config.yaml
-'dataset.path'), builds the SEN12Dataset from just those pairs, wraps it in a
-DataLoader (batch_size=8 -> 20 batches), and runs exactly 1 epoch of the Phase 3
-training loop (Generator + Discriminator forward/backward, all loss terms enabled
-per config) while timing it.
+Selects a random subset (--num-pairs, default 160) of SAR/RGB pairs from the real
+dataset path (configs/config.yaml 'dataset.path'), seeded via
+config.dataset.random_seed (mirroring full-dataset shuffling in real training),
+builds the SEN12Dataset from just those pairs, wraps it in a
+DataLoader (--batch-size, default 8 -> 20 batches), and runs exactly 1 epoch of
+the Phase 3 training loop (Generator + Discriminator forward/backward, all loss
+terms enabled per config) while timing it.
 
 Breakdown focused on *where* the time goes:
   * a 2-batch untimed warmup flushes one-time CUDA/cuDNN init before the timer
@@ -22,11 +24,13 @@ on CUDA.
 Usage:
     python scripts/sanity_test_real_data.py
     python scripts/sanity_test_real_data.py --dataset-path /path/to/agri
+    python scripts/sanity_test_real_data.py --batch-size 16 --num-pairs 320
 """
 
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 import time
 from pathlib import Path
@@ -46,8 +50,8 @@ from losses.perceptual_loss import PerceptualLoss            # noqa: E402
 from losses.semantic_loss import SemanticLoss                # noqa: E402
 from utils.config_loader import load_config                  # noqa: E402
 
-BATCH_SIZE = 8           # 160 // 8 = 20 batches
-TARGET_PAIRS = 160       # timed sample target
+BATCH_SIZE = 8           # default; overridable via --batch-size
+TARGET_PAIRS = 160       # default timed sample target; overridable via --num-pairs
 WARMUP_BATCHES = 2       # untimed throwaway batches before the timer
 FULL_DATASET_SIZE = 4000
 PIN_MEMORY = True        # page-lock host tensors for faster GPU copies
@@ -112,7 +116,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Sanity test on real (subset) data.")
     ap.add_argument("--dataset-path", default=None,
                     help="Path to the agri folder. Defaults to configs/config.yaml 'dataset.path'.")
+    ap.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                    help="Batch size for the DataLoader (default: %(default)s).")
+    ap.add_argument("--num-pairs", type=int, default=TARGET_PAIRS,
+                    help="Number of SAR/RGB pairs to randomly sample for the run "
+                         "(default: %(default)s).")
     args = ap.parse_args()
+
+    batch_size = args.batch_size
+    num_pairs = args.num_pairs
 
     cfg = load_config(str(ROOT / "configs" / "config.yaml"))
     path = args.dataset_path or cfg.dataset.path
@@ -122,10 +134,11 @@ def main() -> int:
     print(f"torch.cuda.is_available() = {torch.cuda.is_available()}   selected device: {device}")
     print(f"dataset path: {path}\n")
 
-    # --- Real pairs: up to TARGET_PAIRS. ---
+    # --- Real pairs: num_pairs randomly sampled from the full scan. ---
     all_pairs, mismatches = build_pairs(path)
     print(f"Total pairs found (full scan): {len(all_pairs)}   mismatches: {len(mismatches)}")
-    pairs = all_pairs[: min(TARGET_PAIRS, len(all_pairs))]
+    rng = random.Random(cfg.dataset.random_seed)
+    pairs = rng.sample(all_pairs, min(num_pairs, len(all_pairs)))
     if not pairs:
         print("WARNING: 0 pairs — nothing to run. "
               "Is the dataset path mounted in this environment?")
@@ -134,12 +147,12 @@ def main() -> int:
     num_channels = cfg.input_channels.num_channels
     num_workers = cfg.train.num_workers
     ds = SEN12Dataset(pairs, num_channels=num_channels)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=PIN_MEMORY)
     n_batches = len(loader)
     # Warmup uses its own (throwaway) iterator passes, so the timed epoch below
     # still covers all n_batches of the real loader -> maximal timed sample.
-    print(f"Using {len(ds)} pairs, batch_size={BATCH_SIZE} num_workers={num_workers} "
+    print(f"Using {len(ds)} pairs, batch_size={batch_size} num_workers={num_workers} "
           f"pin_memory={PIN_MEMORY} -> {n_batches} batches "
           f"(plus {WARMUP_BATCHES} warmup passes, untimed; all {n_batches} timed)\n")
 
@@ -222,7 +235,7 @@ def main() -> int:
     # --- Report + extrapolate. ---
     per = {k: v / timed_batches for k, v in times.items()} if timed_batches else times
     total_stage = per["data_load"] + per["gen_fwd"] + per["disc_fwd"] + per["loss"] + per["backward"]
-    full_epoch_batches = (FULL_DATASET_SIZE + BATCH_SIZE - 1) // BATCH_SIZE
+    full_epoch_batches = (FULL_DATASET_SIZE + batch_size - 1) // batch_size
     full_epoch_sec = total_stage * full_epoch_batches
     total_sec = full_epoch_sec * cfg.train.num_epochs
 
@@ -243,7 +256,7 @@ def main() -> int:
     print(f"  perceptual : {param_device(perceptual) if perceptual else 'disabled'}   "
           f"semantic: {param_device(semantic) if semantic else 'disabled'}")
     print(f"  torch.cuda.is_available(): {torch.cuda.is_available()}")
-    print(f"-- extrapolation ({FULL_DATASET_SIZE} pairs, batch {BATCH_SIZE}, "
+    print(f"-- extrapolation ({FULL_DATASET_SIZE} pairs, batch {batch_size}, "
           f"{cfg.train.num_epochs} epochs) --")
     print(f"  est. sec/epoch on {FULL_DATASET_SIZE} pairs : {full_epoch_sec:.1f}")
     print(f"  est. total: {total_sec:.2f}s (~{total_sec / 60:.2f} min)")
