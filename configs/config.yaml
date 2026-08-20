@@ -47,3 +47,4 @@ ensemble:
 detection:
   dataset_path: "/content/drive/MyDrive/SAR_Project/dataset/voc_style"
   num_classes: 2
+  batch_size: 2

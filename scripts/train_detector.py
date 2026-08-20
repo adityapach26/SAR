@@ -99,6 +99,7 @@ def train_detector(seed, config, output_path):
 
     num_classes = int(config.detection.num_classes)
     lr = float(getattr(config.detection, "learning_rate", config.train.learning_rate))
+    batch_size = getattr(config.detection, "batch_size", None) or config.train.batch_size
     momentum = float(getattr(config.detection, "momentum", 0.9))
     weight_decay = float(getattr(config.detection, "weight_decay", 0.0005))
     n_epochs = config.train.num_epochs
@@ -111,7 +112,7 @@ def train_detector(seed, config, output_path):
           f"num_classes={num_classes}  lr={lr}")
 
     ds = SSDDataset(config.detection.dataset_path, split="train")
-    loader = DataLoader(ds, batch_size=config.train.batch_size, shuffle=True,
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
                         num_workers=config.train.num_workers, pin_memory=True,
                         collate_fn=_collate, drop_last=False)
     print(f"  dataset: {ds.root}")
@@ -125,7 +126,7 @@ def train_detector(seed, config, output_path):
         acc_loss, n_batches = 0.0, 0
         t0 = time.time()
         for i, (images, targets) in enumerate(loader, 1):
-            images = images.to(device)
+            images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             loss_dict = model(images, targets)
@@ -134,14 +135,14 @@ def train_detector(seed, config, output_path):
             loss.backward()
             opt.step()
 
-            acc += loss.item()
+            acc_loss += loss.item()
             n_batches += 1
             if i % log_every == 0 or i == len(loader):
                 print(f"  epoch {epoch}  batch {i}/{len(loader)}  "
                       f"total {loss.item():.4f}  "
                       f"({', '.join(f'{k} {v.item():.4f}' for k, v in loss_dict.items())})")
 
-        print(f"[epoch {epoch}] mean loss {acc / max(n_batches, 1):.4f} "
+        print(f"[epoch {epoch}] mean loss {acc_loss / max(n_batches, 1):.4f} "
               f"({time.time() - t0:.1f}s)")
 
     torch.save(model.state_dict(), out)
