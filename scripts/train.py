@@ -45,7 +45,7 @@ if str(ROOT) not in sys.path:
 from models.generator import Generator            # noqa: E402
 from models.discriminator import PatchGANDiscriminator  # noqa: E402
 from utils.config_loader import load_config        # noqa: E402
-from data.dataset import build_pairs, SEN12Dataset  # noqa: E402
+from data.dataset import build_pairs, SEN12Dataset, split_pairs  # noqa: E402
 from losses.perceptual_loss import PerceptualLoss  # noqa: E402
 from losses.semantic_loss import SemanticLoss  # noqa: E402
 
@@ -60,7 +60,8 @@ def count_scenes(dataset_path: Path) -> int:
 def _build_loader(cfg, pairs, shuffle=True):
     """Wrap an explicit pair list in a parallel, pinned DataLoader."""
     num_channels = cfg.input_channels.num_channels
-    ds = SEN12Dataset(pairs, num_channels=num_channels)
+    ds = SEN12Dataset(pairs, num_channels=num_channels,
+                      texture_kernel_size=cfg.input_channels.texture_kernel_size)
     # Parallel background workers keep image loading off the GPU/math critical
     # path; pin_memory makes host->device copies faster on CUDA systems.
     loader = DataLoader(ds, batch_size=cfg.train.batch_size, shuffle=shuffle,
@@ -70,11 +71,21 @@ def _build_loader(cfg, pairs, shuffle=True):
 
 
 def make_loaders(cfg):
-    """Default split from config: all matching pairs under cfg.dataset.path."""
+    """Default split from config: train/val/test from all matching pairs.
+
+    Returns ``(train_loader, n_train, val_pairs, test_pairs)``. The train loader
+    is built from the train portion only; val/test pair lists are returned for
+    later evaluation.
+    """
     pairs, _mismatches = build_pairs(cfg.dataset.path, num_scenes=count_scenes(cfg.dataset.path))
     if not pairs:
         raise SystemExit(f"no matching image pairs under {cfg.dataset.path!r}")
-    return _build_loader(cfg, pairs, shuffle=True)
+    train_pairs, val_pairs, test_pairs = split_pairs(
+        pairs, cfg.dataset.val_split, cfg.dataset.test_split, cfg.dataset.random_seed)
+    loader, n_train = _build_loader(cfg, train_pairs, shuffle=True)
+    print(f"  split: train={n_train}  val={len(val_pairs)}  "
+          f"test={len(test_pairs)}  (of {len(pairs)} total)")
+    return loader, n_train, val_pairs, test_pairs
 
 
 def save_checkpoint(cfg, epoch, gen, disc, opt_g, opt_d, path):
@@ -105,6 +116,16 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
           * list of pairs     -> train on exactly those (sar_path, rgb_path) pairs
           * DataLoader        -> train on that loader directly
         This supports split-based diversity across runs (not just seed-based).
+
+    Resume
+    ------
+    If ``<checkpoint_dir>/seed{seed}_latest.pt`` exists, this run RESUMES from
+    ``saved_epoch + 1``: the saved generator/discriminator/optimizer state dicts
+    are loaded into freshly-constructed modules and the loop restarts after the
+    saved epoch. Otherwise it starts FRESH at epoch 1. The latest checkpoint is
+    overwritten every ``train.save_every_n_epochs`` (and an epoch-numbered copy
+    ``seed{seed}_epoch_XXXX.pt`` is also kept per save), so a stopped run always
+    has something to resume from.
 
     Returns
     -------
@@ -138,17 +159,20 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
 
     # (3) resolve the data split (train_split overrides the config default)
     if train_split is None:
-        loader, n_samples = make_loaders(config)
+        loader, n_samples, val_pairs, test_pairs = make_loaders(config)
         split_desc = "config default"
+        print(f"  split: {split_desc}  train={n_samples}  val={len(val_pairs)}  "
+              f"test={len(test_pairs)}  batches/epoch={len(loader)}")
     elif isinstance(train_split, DataLoader):
         loader = train_split
         n_samples = len(loader.dataset)
         split_desc = "provided DataLoader"
+        print(f"  split: {split_desc}  samples={n_samples}  batches/epoch={len(loader)}")
     else:
         pairs = list(train_split)
         loader, n_samples = _build_loader(config, pairs, shuffle=True)
         split_desc = f"provided split ({len(pairs)} pairs)"
-    print(f"  split: {split_desc}  samples={n_samples}  batches/epoch={len(loader)}")
+        print(f"  split: {split_desc}  samples={n_samples}  batches/epoch={len(loader)}")
 
     # Auxiliary losses are built only when enabled (heavy + frozen).
     perceptual = PerceptualLoss().to(device) if lambda_perc > 0 else None
@@ -162,7 +186,30 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
     ckpt_dir = Path(config.paths.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, n_epochs + 1):
+    # ---- resume support ----
+    # A seed-specific "latest" checkpoint is overwritten at every save interval,
+    # so a stopped/crashed run can pick up from the last saved epoch. Uses the
+    # freshly-constructed models/optimizers, then overwrites them with the loaded
+    # state dicts (correct arch + device via map_location).
+    latest_path = ckpt_dir / f"seed{seed}_latest.pt"
+    start_epoch = 1
+    if latest_path.exists():
+        try:
+            _latest = torch.load(latest_path, map_location=device)
+            start_epoch = int(_latest["epoch"]) + 1
+            gen.load_state_dict(_latest["generator_state_dict"])
+            disc.load_state_dict(_latest["discriminator_state_dict"])
+            opt_g.load_state_dict(_latest["optimizer_g_state_dict"])
+            opt_d.load_state_dict(_latest["optimizer_d_state_dict"])
+            print(f"[resume] found {latest_path} (epoch {_latest['epoch']}) -> "
+                  f"RESUMING from epoch {start_epoch}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[resume] WARNING could not load {latest_path}: {e} -> starting fresh")
+            start_epoch = 1
+    else:
+        print(f"[resume] no checkpoint at {latest_path} -> FRESH start from epoch 1")
+
+    for epoch in range(start_epoch, n_epochs + 1):
         gen.train()
         disc.train()
         acc = {"d": 0.0, "g_adv": 0.0, "g_l1": 0.0, "g_perc": 0.0, "g_sem": 0.0,
@@ -226,9 +273,12 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
               f"perc {acc['g_perc'] / acc['n']:.4f} + sem {acc['g_sem'] / acc['n']:.4f}) "
               f"{time.time() - t0:.1f}s")
 
+        # Always write the seed-specific "latest" checkpoint (resumable), and
+        # additionally snap an epoch-numbered copy when saving past a boundary.
         if epoch % save_every == 0 or epoch == n_epochs:
-            path = ckpt_dir / f"epoch_{epoch:04d}.pt"
-            save_checkpoint(config, epoch, gen, disc, opt_g, opt_d, path)
+            save_checkpoint(config, epoch, gen, disc, opt_g, opt_d, latest_path)
+            snapped = ckpt_dir / f"seed{seed}_epoch_{epoch:04d}.pt"
+            save_checkpoint(config, epoch, gen, disc, opt_g, opt_d, snapped)
 
     # Save the final generator weights to the requested path.
     out = Path(output_checkpoint_path)

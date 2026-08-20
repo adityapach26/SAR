@@ -1,4 +1,5 @@
 import os
+import random
 import time
 import numpy as np
 from PIL import Image
@@ -84,6 +85,60 @@ def build_pairs(dataset_path: str, num_scenes: int | None = None):
     return pairs, []
 
 
+def split_pairs(pairs, val_split, test_split, seed):
+    """Deterministic shuffle + train/val/test split of a pair list.
+
+    The order is decided by a seed-driven ``random.Random`` (not the global
+    RNG), so the exact split is reproducible from ``seed``. ``val_split`` and
+    ``test_split`` are fractions of the full list; the remainder goes to train.
+    Small lists guard against zero-length val/test (at least 1 each) by
+    borrowing from train.
+
+    Parameters
+    ----------
+    pairs : list[tuple[str, str]]
+        (sar_path, rgb_path) pairs from build_pairs.
+    val_split : float
+        Fraction for validation (0..1).
+    test_split : float
+        Fraction for test (0..1). train_split = 1 - val_split - test_split.
+    seed : int
+        Deterministic RNG seed.
+
+    Returns
+    -------
+    (train_pairs, val_pairs, test_pairs)
+    """
+    total = len(pairs)
+    if total == 0:
+        return [], [], []
+
+    rng = random.Random(seed)
+    order = list(range(total))
+    rng.shuffle(order)
+
+    val_n = max(0, int(round(total * val_split)))
+    test_n = max(0, int(round(total * test_split)))
+
+    # Fractions are small on a tiny list; guarantee at least one each by
+    # borrowing from train (train may then be empty, which is fine).
+    if val_n == 0:
+        val_n, test_n = 1, max(test_n, 1)
+    elif test_n == 0:
+        test_n = 1
+    # Bound so val + test never exceed the pool.
+    test_n = min(test_n, total - val_n)
+
+    # Disjoint slices of the same shuffled order -> no overlap between folds.
+    val_idx = set(order[:val_n])
+    test_idx = set(order[val_n:val_n + test_n])
+
+    train = [p for i, p in enumerate(pairs) if i not in val_idx and i not in test_idx]
+    val = [p for i, p in enumerate(pairs) if i in val_idx]
+    test = [p for i, p in enumerate(pairs) if i in test_idx]
+    return train, val, test
+
+
 class SEN12Dataset(Dataset):
     """
     Dataset for SEN1-2 SAR-RGB pairs.
@@ -93,7 +148,7 @@ class SEN12Dataset(Dataset):
         rgb_tensor: Tensor of shape (3, H, W)
     Both tensors are normalized to [-1, 1] to match Tanh output range.
     """
-    def __init__(self, pairs, num_channels=1, profile=False):
+    def __init__(self, pairs, num_channels=1, profile=False, texture_kernel_size=3):
         """
         Parameters
         ----------
@@ -104,11 +159,14 @@ class SEN12Dataset(Dataset):
         profile : bool, optional
             When True, accumulate per-stage wall-times in ``self.profile_times``
             (does NOT alter the returned tensors — only adds timing).
+        texture_kernel_size : int, optional
+            uniform_filter kernel for the multichannel texture channel (default 3).
         """
         self.pairs = pairs
         self.num_channels = num_channels
         self.profile = bool(profile)
         self.profile_times = {"pil_sar": 0.0, "multichannel": 0.0, "pil_rgb": 0.0}
+        self.texture_kernel_size = int(texture_kernel_size)
         if self.num_channels not in (1, 3):
             raise ValueError("num_channels must be 1 or 3")
 
@@ -138,7 +196,7 @@ class SEN12Dataset(Dataset):
         else:  # num_channels == 3
             # Use build_multichannel_input to get (3, H, W) in [0, 1]
             _t = time.time()
-            sar_np_float = build_multichannel_input(sar_np, kernel_size=7)  # shape (3, H, W), float32 in [0,1]
+            sar_np_float = build_multichannel_input(sar_np, kernel_size=self.texture_kernel_size)  # (3,H,W) float32 [0,1]
             if self.profile:
                 self.profile_times["multichannel"] += time.time() - _t
             sar_tensor = torch.from_numpy(sar_np_float)  # shape (3, H, W)
