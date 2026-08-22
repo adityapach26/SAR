@@ -404,7 +404,44 @@ def main() -> int:
             top = max(dets, key=lambda d: d["score"])
             print(f"    top detection             : score={top['score']:.3f}  "
                   f"uncertainty={top['uncertainty']:.4f}  models={top['count']}/{num_members}")
-        print("[z] OK — full chain ran without errors in one call.")
+
+        # ---- save viewable outputs (input SAR / translated RGB / uncertainty) ----
+        out_dir = Path(cfg.paths.output_dir) / "phase6"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(args.sar).stem
+
+        rgb_pil = transforms.functional.to_pil_image(out["rgb_output_01"].clamp(0, 1).float().cpu())
+        rgb_path = out_dir / f"translated_rgb_{stem}.png"
+        rgb_pil.save(rgb_path)
+
+        # Uncertainty heatmap as normalized grayscale (red=high, green=low via matplotlib).
+        hv_cpu = hv.float().cpu()
+        hv_norm = (hv_cpu - hv_cpu.min()) / (hv_cpu.max() - hv_cpu.min() + 1e-8)  # [0,1]
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(4, 4))
+        im = ax.imshow(hv_norm.numpy(), cmap="RdYlGn_r", vmin=0, vmax=1)  # red=high unc
+        ax.axis("off")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+        unc_path = out_dir / f"uncertainty_heatmap_{stem}.png"
+        fig.savefig(unc_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+
+        # Original SAR (resized to 256x256, pre-translation) for side-by-side compare.
+        sar_in = _load_sar(args.sar, config=cfg)  # (C, 256, 256) [-1,1]
+        sar_01 = ((sar_in + 1.0) / 2.0).clamp(0, 1)
+        if sar_01.shape[0] == 1:
+            sar_01 = sar_01.repeat(3, 1, 1)  # grayscale -> RGB for viewing
+        sar_pil = transforms.functional.to_pil_image(sar_01.float().cpu())
+        sar_path = out_dir / f"input_sar_{stem}.png"
+        sar_pil.save(sar_path)
+
+        print("[z] saved:")
+        print(f"      input SAR         -> {sar_path}")
+        print(f"      translated RGB    -> {rgb_path}")
+        print(f"      uncertainty map   -> {unc_path}")
+        print("[z] OK — full chain ran without errors and images saved.")
         return 0
 
     # Dummy SAR is built on CPU; move it to the same device the generator
