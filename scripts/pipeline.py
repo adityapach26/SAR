@@ -41,8 +41,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import numpy as np
+from PIL import Image
+
 from utils.config_loader import load_config  # noqa: E402
 from models.generator import Generator  # noqa: E402
+from data.channel_stack import build_multichannel_input  # noqa: E402
 
 
 def _default_device() -> torch.device:
@@ -260,6 +264,82 @@ def run_detector_ensemble(rgb_input, checkpoint_dir, num_members: int,
     return {"merged": merged, "n_dets": len(merged), "n_all": n_all, "n_single": n_single}
 
 
+def _load_sar(sar_image_path, config):
+    """Load a real SAR image file and preprocess it exactly as the Generator sees it.
+
+    Mirrors :meth:`data.dataset.GANFolder.__getitem__`: SAR is read as grayscale
+    (``L``), built into the multichannel input via data.channel_stack
+    ``build_multichannel_input`` (kernel ``config.input_channels.texture_kernel_size``)
+    as ``(3, H, W)`` in ``[0, 1]``, then normalized to the Generator's ``[-1, 1]``
+    range. Returns a ``(C, H, W)`` float tensor.
+    """
+    sar_img = Image.open(sar_image_path).convert("L")  # single channel (H, W)
+    sar_np = np.array(sar_img, dtype=np.uint8)
+    num_channels = int(config.input_channels.num_channels)
+    if num_channels == 1:
+        sar_tensor = torch.from_numpy(sar_np).float() / 255.0
+        sar_tensor = sar_tensor * 2.0 - 1.0
+        sar_tensor = sar_tensor.unsqueeze(0)  # (1, H, W)
+    else:  # num_channels == 3 -> build the same multichannel stack as training
+        kernel = int(config.input_channels.texture_kernel_size)
+        sar_np_float = build_multichannel_input(sar_np, kernel_size=kernel)  # (3, H, W) [0,1]
+        sar_tensor = torch.from_numpy(sar_np_float)  # (3, H, W)
+        sar_tensor = sar_tensor * 2.0 - 1.0  # [-1, 1]
+    return sar_tensor
+
+
+@torch.no_grad()
+def run_pipeline(sar_image_path, config=None):
+    """End-to-end SAR -> generator ensemble -> detector ensemble (Phase 6, Step 6.3).
+
+    Chains the two ensemble steps in a single call and returns one dict:
+
+    Parameters
+    ----------
+    sar_image_path : str | Path
+        On-disk SAR image (grayscale or RGB; loaded as ``L``).
+    config : Config | None
+        Loaded config (defaults to ``configs/config.yaml``).
+
+    Returns
+    -------
+    dict with keys:
+        rgb_output             : mean_rgb tensor ``(C, H, W)`` in ``[-1, 1]`` (Generator out).
+        uncertainty_heatmap    : generator-ensemble variance_map ``(H, W)``.
+        rgb_output_01          : same mean_rgb in ``[0, 1]`` (what the detector consumes).
+        detections             : merged detection list (``detector_ensemble["merged"]``).
+        detection_uncertainty  : dict ``{n_all, n_single}`` (detector ensemble counts).
+    """
+    if config is None:
+        config = load_config(str(ROOT / "configs" / "config.yaml"))
+
+    sar = _load_sar(sar_image_path, config).to(_default_device())  # (C, H, W)[-1,1]
+    sar = sar.unsqueeze(0)  # Generator expects a batched (1, C, H, W)
+
+    ckpt_dir = Path(config.paths.checkpoint_dir)
+    num_members = int(config.ensemble.num_members)
+    seeds = list(config.ensemble.seeds)
+
+    mean_rgb, variance_map = run_generator_ensemble(
+        sar, ckpt_dir, num_members, seeds=seeds, config=config
+    )  # mean_rgb (1,C,H,W) [-1,1]; variance_map (1,H,W)
+
+    rgb = mean_rgb[0]                      # (C, H, W) [-1, 1]
+    rgb_01 = (rgb + 1.0).clamp(0.0, 1.0) / 2.0  # -> [0, 1] for the detector
+
+    det_res = run_detector_ensemble(
+        rgb_01, ckpt_dir, num_members, seeds=seeds, config=config
+    )
+
+    return {
+        "rgb_output": rgb,
+        "rgb_output_01": rgb_01,
+        "uncertainty_heatmap": variance_map[0],  # (H, W)
+        "detections": det_res["merged"],
+        "detection_uncertainty": {"n_all": det_res["n_all"], "n_single": det_res["n_single"]},
+    }
+
+
 def _make_dummy_sar(config, batch=1, size=256):
     c = int(config.input_channels.num_channels)
     return torch.randn(batch, c, size, size)
@@ -280,6 +360,8 @@ def main() -> int:
     ap.add_argument("--members", type=int, default=None,
                     help="number of members (default: ensemble.num_members)")
     ap.add_argument("--size", type=int, default=256, help="dummy SAR image side (squared)")
+    ap.add_argument("--sar", default=None,
+                    help="run end-to-end run_pipeline() on a real SAR image file instead of the dummy tests")
     args = ap.parse_args()
 
     cfg = load_config(str(ROOT / "configs" / "config.yaml"))
@@ -287,6 +369,33 @@ def main() -> int:
     num_members = args.members or int(cfg.ensemble.num_members)
     seeds = list(cfg.ensemble.seeds)
     print(f"checkpoint_dir={ckpt_dir}  members={num_members}  seeds={seeds}")
+
+    # (z) Phase 6.3 — end-to-end pipeline on a real SAR image.
+    if args.sar:
+        if not Path(args.sar).exists():
+            print(f"[z] SKIPPED — SAR file not found: {args.sar}")
+            return 0
+        print(f"\n[z] run_pipeline on SAR: {args.sar}")
+        try:
+            out = run_pipeline(args.sar, config=cfg)
+        except FileNotFoundError as e:
+            print(f"[z] SKIPPED — missing checkpoint: {e}")
+            return 0
+        hv = out["uncertainty_heatmap"]
+        dets = out["detections"]
+        print(f"    rgb_output shape          : {tuple(out['rgb_output'].shape)}  [-1,1]")
+        print(f"    rgb_output_01 shape       : {tuple(out['rgb_output_01'].shape)}  [0,1]")
+        print(f"    uncertainty_heatmap       : min={hv.min().item():.6g}  "
+              f"max={hv.max().item():.6g}  mean={hv.mean().item():.6g}  shape={tuple(hv.shape)}")
+        print(f"    detections found          : {len(dets)}")
+        du = out["detection_uncertainty"]
+        print(f"    detection_uncertainty     : {du}")
+        if dets:
+            top = max(dets, key=lambda d: d["score"])
+            print(f"    top detection             : score={top['score']:.3f}  "
+                  f"uncertainty={top['uncertainty']:.4f}  models={top['count']}/{num_members}")
+        print("[z] OK — full chain ran without errors in one call.")
+        return 0
 
     # Dummy SAR is built on CPU; move it to the same device the generator
     # models load onto (CUDA if available, else CPU) to avoid a device mismatch.
