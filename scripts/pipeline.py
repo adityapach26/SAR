@@ -34,10 +34,15 @@ from utils.config_loader import load_config  # noqa: E402
 from models.generator import Generator  # noqa: E402
 
 
+def _default_device() -> torch.device:
+    """The device the generator models land on: CUDA if available, else CPU."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def generator_from_config(config, device=None):
     """Build a fresh Generator matching how the ensemble trained them."""
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = _default_device()
     return Generator(
         sar_channels=int(config.input_channels.num_channels),
         rgb_channels=3,
@@ -129,7 +134,9 @@ def main() -> int:
     seeds = list(cfg.ensemble.seeds)
     print(f"checkpoint_dir={ckpt_dir}  members={num_members}  seeds={seeds}")
 
-    sar = _make_dummy_sar(cfg, size=args.size)
+    # Dummy SAR is built on CPU; move it to the same device the generator
+    # models load onto (CUDA if available, else CPU) to avoid a device mismatch.
+    sar = _make_dummy_sar(cfg, size=args.size).to(_default_device())
 
     # (a) run the full function with the real checkpoint dir.
     real_paths = [ckpt_dir / f"generator_seed{s}.pt" for s in seeds[:num_members]]
@@ -153,14 +160,18 @@ def main() -> int:
         print(f"\n[a/b] SKIPPED — need checkpoints in {ckpt_dir}; missing {missing}")
         return 0
 
-    # (c) CRITICAL: same checkpoint used 3x => variance EXACTLY zero everywhere.
+    # (c) CRITICAL: same checkpoint used 3x => variance ~zero everywhere.
+    # Identical deterministic weights on the same input must produce no real
+    # discrepancy, but GPU convolutions are not bit-reproducible, so a tolerance
+    # of 1e-6 separates true signal (~1.0 for distinct members) from this noise
+    # (observed ~2e-13 on GPU).
     print("\n[c] CRITICAL zero-variance check (same checkpoint repeated 3x):")
     same = [real_paths[0]] * 3
     _, _, var_same = _run_members(sar, same, cfg)
-    exact = bool((var_same == 0).all())
+    exact = bool(torch.allclose(var_same, torch.zeros_like(var_same), atol=1e-6))
     print(f"    max variance = {var_same.max().item():.6g}")
-    print("    PASS: variance is EXACTLY zero (identical deterministic weights)"
-          if exact else "    FAIL: expected EXACTLY zero variance, got nonzero")
+    print("    PASS: variance within 1e-6 of zero (identical deterministic weights)"
+          if exact else "    FAIL: variance exceeded 1e-6 for identical weights")
 
     # (e) real distinct checkpoints => nonzero, spatially varying variance.
     print("\n[e] real distinct generator_seed1/2/3 variance:")
