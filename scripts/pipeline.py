@@ -36,6 +36,7 @@ from pathlib import Path
 
 import torch
 import torchvision
+from torchvision import transforms
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -272,8 +273,17 @@ def _load_sar(sar_image_path, config):
     ``build_multichannel_input`` (kernel ``config.input_channels.texture_kernel_size``)
     as ``(3, H, W)`` in ``[0, 1]``, then normalized to the Generator's ``[-1, 1]``
     range. Returns a ``(C, H, W)`` float tensor.
+
+    The image is resized to ``config.dataset.image_size`` (256) first, matching
+    the fixed-size assumption the Generator's U-Net is built around (its skip
+    connections require spatial dims divisible by 32). The training pipeline in
+    ``data/dataset.py`` performs no resize and assumes inputs already match
+    ``image_size``; here we apply a standard bilinear ``transforms.Resize`` so
+    arbitrary input dimensions normalize to the same target.
     """
     sar_img = Image.open(sar_image_path).convert("L")  # single channel (H, W)
+    target = int(config.dataset.image_size)
+    sar_img = transforms.Resize((target, target))(sar_img)  # match fixed 256x256 arch
     sar_np = np.array(sar_img, dtype=np.uint8)
     num_channels = int(config.input_channels.num_channels)
     if num_channels == 1:
