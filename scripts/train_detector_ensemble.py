@@ -3,9 +3,9 @@
 Reads ``ensemble.seeds`` from config (currently ``[1, 2, 3]``, the same seeds
 as the generator ensemble). For each seed it calls the existing
 :func:`train_detector` from :mod:`scripts.train_detector`, saving the fine-tuned
-detector to ``checkpoints/detector_seed{seed}.pt``.
+detector to ``<paths.checkpoint_dir>/detector_seed{seed}.pt`` (Drive, via config).
 
-Resume / skip: if ``checkpoints/detector_seed{seed}.pt`` already exists on disk
+Resume / skip: if ``<paths.checkpoint_dir>/detector_seed{seed}.pt`` already exists on disk
 (``Path.exists()``), that seed is skipped instead of retrained — the same
 existence-check style the engine uses for its checkpoint resume, so a crashed or
 partially-finished run can be re-launched idempotently.
@@ -58,7 +58,7 @@ def main() -> int:
     cfg.train.num_epochs = epochs  # train_detector reads its epoch count from config.train
 
     seeds = list(cfg.ensemble.seeds)
-    checkpoint_dir = ROOT / "checkpoints"
+    checkpoint_dir = Path(cfg.paths.checkpoint_dir)
     t_start = time.time()
 
     print(f"ensemble: detector  members={len(seeds)}  seeds={seeds}  "
