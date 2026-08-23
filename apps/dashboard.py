@@ -81,20 +81,44 @@ def main() -> None:
         "ensemble, and colors each detection by confidence + uncertainty."
     )
 
-    # ---- sidebar: single ground-truth config + checkpoint path override ----
-    with st.sidebar:
-        st.header("Config")
-        default_members = int(cfg.ensemble.num_members)
-        num_members = st.number_input("Ensemble members", 1, 5, default_members)
+    translation_tab, detections_tab, uncertainty_tab, settings_tab = st.tabs(
+        ["Translation", "Detections", "Uncertainty", "Settings"]
+    )
+
+    # ---- settings: inference controls only ----
+    with settings_tab:
+        st.header("Settings")
+        model_set = st.selectbox("Model set", ["Agriculture", "Water Best"])
+        default_members = min(int(cfg.ensemble.num_members), 3)
+        num_members = st.number_input("Ensemble members", 1, 3, default_members)
         ckpt_dir = st.text_input(
             "Checkpoint dir", value=str(cfg.paths.checkpoint_dir)
         )
-        st.caption("Real checkpoints live on Drive; over-ride to ./checkpoints for local runs.")
+        st.caption("Real checkpoints live on Drive; override to ./checkpoints for local runs.")
+
+        st.subheader("Detection")
+        score_threshold = st.slider("Detection score threshold", 0.0, 1.0, 0.5, 0.05)
+        iou_thresh = st.slider("IoU merge threshold", 0.0, 1.0, 0.5, 0.05)
+
+        st.subheader("Visualization")
+        show_unc = st.checkbox("Show generator-ensemble uncertainty heatmap")
+        show_grad_gen = st.checkbox("Show generator Grad-CAM")
+        show_grad_det = st.checkbox("Show detector Grad-CAM")
+        heatmap_opacity = st.slider("Heatmap opacity", 0.0, 1.0, 0.45, 0.05)
 
     ckpt_dir = Path(ckpt_dir)
+    num_members = int(num_members)
+    water_best_names = [f"water_finetune_seed{s}_best.pt" for s in cfg.ensemble.seeds[:num_members]]
+    generator_checkpoint_names = water_best_names if model_set == "Water Best" else None
+    first_generator_checkpoint = (
+        ckpt_dir / water_best_names[0]
+        if model_set == "Water Best"
+        else ckpt_dir / f"generator_seed{cfg.ensemble.seeds[0]}.pt"
+    )
 
     # ---- 8.1 upload ----
-    uploaded = st.file_uploader("Upload a SAR image", type=["png", "jpg", "jpeg", "tif", "tiff"])
+    with translation_tab:
+        uploaded = st.file_uploader("Upload a SAR image", type=["png", "jpg", "jpeg", "tif", "tiff"])
 
     if uploaded is None:
         st.info("Upload a SAR image to begin.")
@@ -113,11 +137,21 @@ def main() -> None:
     tmp = Path(f"/tmp/sar_dash{suffix}")
     tmp.write_bytes(raw)
 
+    if model_set == "Water Best":
+        missing = [name for name in water_best_names if not (ckpt_dir / name).exists()]
+        if missing:
+            st.error("Missing Water Best generator checkpoint(s): " + ", ".join(missing))
+            return
+
     with st.spinner("Running generator ensemble…"):
         sar = _load_sar(str(tmp), cfg).to(dev)  # (C, H, W) [-1,1]
         sar_b = sar.unsqueeze(0)               # (1, C, H, W)
         mean_rgb, var_map = run_generator_ensemble(
-            sar_b, ckpt_dir, num_members, config=cfg
+            sar_b,
+            ckpt_dir,
+            num_members,
+            config=cfg,
+            checkpoint_filenames=generator_checkpoint_names,
         )  # mean_rgb (1,C,H,W)[-1,1]; var_map (1,H,W)
     rgb = mean_rgb[0]                       # (C,H,W) [-1,1]
     rgb_01 = ((rgb + 1.0).clamp(0, 1)) / 2.0  # -> [0,1] for the detector
@@ -128,13 +162,22 @@ def main() -> None:
     sar_pil = Image.fromarray((_numpy_rgb(sar_01) * 255).astype(np.uint8))
     rgb_pil = Image.fromarray((_numpy_rgb(rgb_01) * 255).astype(np.uint8))
 
+    st.markdown(f"**Model set:** {model_set}  ")
+    st.markdown(f"**Ensemble members:** {num_members}")
     c1, c2 = st.columns(2)
     c1.image(sar_pil, caption="Input SAR", use_container_width=True)
     c2.image(rgb_pil, caption="Translated RGB (ensemble mean)", use_container_width=True)
 
     # ---------------------------------------------------------------- 8.3 ---
     st.subheader("8.3 — Detections")
-    det_res = run_detector_ensemble(rgb_01, ckpt_dir, num_members, config=cfg)
+    det_res = run_detector_ensemble(
+        rgb_01,
+        ckpt_dir,
+        num_members,
+        config=cfg,
+        score_threshold=score_threshold,
+        iou_thresh=iou_thresh,
+    )
     dets = det_res["merged"]
 
     if not dets:
@@ -161,19 +204,15 @@ def main() -> None:
             )
 
     # ---------------------------------------------------------------- 8.4 ---
-    st.subheader("8.4 — Uncertainty heatmap + Grad-CAM toggles")
-    with st.expander("Toggle overlays", expanded=True):
-        show_unc = st.checkbox("Show generator-ensemble uncertainty heatmap")
-        show_grad_gen = st.checkbox("Show generator Grad-CAM")
-        show_grad_det = st.checkbox("Show detector Grad-CAM")
+    with uncertainty_tab:
+        st.subheader("8.4 — Uncertainty heatmap + Grad-CAM toggles")
+        st.caption("Overlay controls live in the Settings tab.")
 
     def _blend_heat(heat: np.ndarray, base: Image.Image) -> Image.Image:
-        """Mix a jet-colored heatmap under ``base`` (RGB) at ~45% opacity."""
+        """Mix a jet-colored heatmap under ``base`` (RGB)."""
         heat_rgba = _to_heat_pil(heat).convert("RGBA")
         base_rgba = base.convert("RGBA")
-        under = Image.blend(base_rgba, heat_rgba, 0.45)
-        # put the image back on top so structure stays visible behind the heat
-        return Image.alpha_composite(under, base_rgba).convert("RGB")
+        return Image.blend(base_rgba, heat_rgba, heatmap_opacity).convert("RGB")
 
     if show_unc:
         hv = var_map[0].float().cpu().numpy()
@@ -189,9 +228,7 @@ def main() -> None:
     if show_grad_gen:
         with st.spinner("Building generator Grad-CAM…"):
             gen = generator_from_config(cfg, dev).eval()
-            gen.load_state_dict(torch.load(
-                ckpt_dir / f"generator_seed{cfg.ensemble.seeds[0]}.pt",
-                map_location=dev))
+            gen.load_state_dict(torch.load(first_generator_checkpoint, map_location=dev))
             heat = generator_gradcam(gen, sar, save=False).numpy()
             gen_gc = _blend_heat(heat, rgb_pil)
     if gen_gc is not None:

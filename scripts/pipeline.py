@@ -91,7 +91,7 @@ def _run_members(sar_input: torch.Tensor, ckpt_paths: list[Path], config):
 
 @torch.no_grad()
 def run_generator_ensemble(sar_input: torch.Tensor, checkpoint_dir, num_members: int,
-                           seeds=None, config=None):
+                           seeds=None, config=None, checkpoint_filenames=None):
     """Run ``sar_input`` through ``num_members`` generator checkpoints.
 
     Returns
@@ -112,7 +112,15 @@ def run_generator_ensemble(sar_input: torch.Tensor, checkpoint_dir, num_members:
             f"num_members={num_members} but only {len(seeds)} seeds available"
         )
 
-    paths = [ckpt_dir / f"generator_seed{s}.pt" for s in member_seeds]
+    if checkpoint_filenames is None:
+        paths = [ckpt_dir / f"generator_seed{s}.pt" for s in member_seeds]
+    else:
+        names = list(checkpoint_filenames)[:num_members]
+        if len(names) < num_members:
+            raise ValueError(
+                f"num_members={num_members} but only {len(names)} checkpoint names provided"
+            )
+        paths = [ckpt_dir / name for name in names]
     missing = [str(p) for p in paths if not p.exists()]
     if missing:
         raise FileNotFoundError(f"generator checkpoint(s) not found: {missing}")
