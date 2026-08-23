@@ -53,16 +53,15 @@ def _n_expected_pairs() -> int:
 
 
 def _build_water_pairs(water_dir):
-    """Pair water SAR/RGB images in a FLAT folder by common stem.
+    """Pair water SAR/RGB images from water/s1 and water/s2 by common stem.
 
-    The water dataset keeps both suffixes in ONE directory::
+    The water dataset layout is::
 
-        water_0000_s1.png   (SAR)
-        water_0000_s2.png   (RGB)
+        water/s1/water_0000_s1.png   (SAR)
+        water/s2/water_0000_s2.png   (RGB)
 
-    paired by the shared stem ``water_0000``. This is water-specific — the agri
-    layout (s1/ + s2/ subfolders, ``_s1_``/``_s2_`` tokens) is parsed only by
-    ``data.dataset.build_pairs`` and is untouched here.
+    paired by the shared stem ``water_0000``. This is water-specific and does
+    not modify the existing agriculture pairing in ``data.dataset.build_pairs``.
 
     Returns
     -------
@@ -70,21 +69,21 @@ def _build_water_pairs(water_dir):
     stats : dict with n_sar, n_rgb, n_pairs, unmatched_sar, unmatched_rgb, dup_ids.
     """
     water_dir = Path(water_dir)
-    if not water_dir.is_dir():
+    s1_dir = water_dir / "s1"
+    s2_dir = water_dir / "s2"
+    if not s1_dir.is_dir() or not s2_dir.is_dir():
         return [], {
             "n_sar": 0, "n_rgb": 0, "n_pairs": 0,
             "unmatched_sar": 0, "unmatched_rgb": 0, "dup_ids": 0,
         }
-    imgs = [
-        p for p in water_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".tif", ".tiff")
-    ]
+
+    exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
     sar, rgb = {}, {}
-    for p in imgs:
-        lower = p.name.lower()
-        if lower.endswith("_s1.png"):
+    for p in sorted(s1_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in exts and p.name.lower().endswith("_s1.png"):
             sar.setdefault(p.name[: -len("_s1.png")], []).append(p)
-        elif lower.endswith("_s2.png"):
+    for p in sorted(s2_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in exts and p.name.lower().endswith("_s2.png"):
             rgb.setdefault(p.name[: -len("_s2.png")], []).append(p)
 
     dup_ids = sum(1 for bucket in (*sar.values(), *rgb.values()) if len(bucket) > 1)
