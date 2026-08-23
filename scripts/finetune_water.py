@@ -4,8 +4,8 @@ Reuses the existing training loop :func:`scripts.train.train_generator` with
 zero architecture/recipe changes. It only supplies:
 
   * the *water* dataset path (``config.dataset.water_path`` / ``--dataset-path``),
-  * ALL water SAR/RGB pairs as the training set (no val/test split — this is a
-    short adaptation stage, 697 pairs, nothing thrown away),
+  * a fixed 90/10 water train/test split (pair-level; seed 42, independent of
+    model seed),
   * the trained-agriculture checkpoint ``seed{seed}_latest.pt`` as the *
     read-only*bootstrap weights,
   * the fine-tune hyperparameters (``config.finetune.*`` or CLI overrides),
@@ -37,7 +37,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.config_loader import load_config            # noqa: E402
-from data.dataset import build_pairs, SEN12Dataset     # noqa: E402
+from data.dataset import SEN12Dataset                  # noqa: E402
 from scripts.train import train_generator              # noqa: E402
 from models.generator import Generator                 # noqa: E402
 from models.discriminator import PatchGANDiscriminator  # noqa: E402
@@ -52,15 +52,66 @@ def _n_expected_pairs() -> int:
     return 697
 
 
+def _build_water_pairs(water_dir):
+    """Pair water SAR/RGB images in a FLAT folder by common stem.
+
+    The water dataset keeps both suffixes in ONE directory::
+
+        water_0000_s1.png   (SAR)
+        water_0000_s2.png   (RGB)
+
+    paired by the shared stem ``water_0000``. This is water-specific — the agri
+    layout (s1/ + s2/ subfolders, ``_s1_``/``_s2_`` tokens) is parsed only by
+    ``data.dataset.build_pairs`` and is untouched here.
+
+    Returns
+    -------
+    pairs : list[(sar_path_str, rgb_path_str)] sorted by stem.
+    stats : dict with n_sar, n_rgb, n_pairs, unmatched_sar, unmatched_rgb, dup_ids.
+    """
+    water_dir = Path(water_dir)
+    if not water_dir.is_dir():
+        return [], {
+            "n_sar": 0, "n_rgb": 0, "n_pairs": 0,
+            "unmatched_sar": 0, "unmatched_rgb": 0, "dup_ids": 0,
+        }
+    imgs = [
+        p for p in water_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+    ]
+    sar, rgb = {}, {}
+    for p in imgs:
+        lower = p.name.lower()
+        if lower.endswith("_s1.png"):
+            sar.setdefault(p.name[: -len("_s1.png")], []).append(p)
+        elif lower.endswith("_s2.png"):
+            rgb.setdefault(p.name[: -len("_s2.png")], []).append(p)
+
+    dup_ids = sum(1 for bucket in (*sar.values(), *rgb.values()) if len(bucket) > 1)
+    unmatched_sar = len(set(sar) - set(rgb))
+    unmatched_rgb = len(set(rgb) - set(sar))
+    stems = sorted(set(sar) & set(rgb))
+    pairs = [(str(sar[s][0]), str(rgb[s][0])) for s in stems]
+    stats = {
+        "n_sar": sum(map(len, sar.values())),
+        "n_rgb": sum(map(len, rgb.values())),
+        "n_pairs": len(pairs),
+        "unmatched_sar": unmatched_sar,
+        "unmatched_rgb": unmatched_rgb,
+        "dup_ids": dup_ids,
+    }
+    return pairs, stats
+
+
 def _split_for_finetune(pairs, test_split: float, split_seed: int):
     """Deterministic 90/10 train/test split at the PAIR level.
 
     Slices the pair list by index under a fixed ``random.Random(split_seed)``
     shuffle — a tuple ``(sar_path, rgb_path)`` always stays together, the two
-    folds are disjoint, and their union is the full list. Because ``build_pairs``
-    returns pairs in a deterministic (sorted) order and ``split_seed`` is fixed
-    (``finetune.split_seed: 42``, NOT the model seed 1/2/3), every fine-tune run
-    sees the identical train/test split.
+    folds are disjoint, and their union is the full list. Because
+    ``_build_water_pairs`` returns pairs in deterministic sorted-stem order and
+    ``split_seed`` is fixed (``finetune.split_seed: 42``, NOT the model seed
+    1/2/3), every fine-tune run sees the identical train/test split.
     """
     pairs = list(pairs)
     total = len(pairs)
@@ -145,43 +196,55 @@ def dry_run(cfg, args):
 
     status = True
 
-    # (1)+(2) water dataset loads & 697 matching pairs (only checkable on Drive)
-    print(f"\nwater dataset path = {water}")
+    # (1)+(2) water dataset loads & flat-folder pairing (only checkable on Drive)
+    print(f"\nWater dataset path: {water}")
     if water.is_dir():
-        pairs, mismatches = build_pairs(str(water))
-        status &= report(
-            1, len(pairs) == _n_expected_pairs() and not mismatches,
-            f"{len(pairs)} matching water pairs, {len(mismatches)} mismatches "
-            f"(expected 697, 0)")
+        pairs, st = _build_water_pairs(water)
+        if not pairs:
+            # never descend into index-based pairing when nothing was found
+            print("[1] FAIL: no matching water pairs found (mount Drive? wrong path?)")
+            return 1
+        print(f"SAR files: {st['n_sar']}\nRGB files: {st['n_rgb']}\n"
+              f"Matching pairs: {st['n_pairs']}\nUnmatched SAR: {st['unmatched_sar']}\n"
+              f"Unmatched RGB: {st['unmatched_rgb']}\nDuplicate pair IDs: {st['dup_ids']}")
+        example = pairs[0]
+        print(f"Example pair:\n{Path(example[0]).name} <-> {Path(example[1]).name}")
 
-        # (2) pairing correctness: every sar filename must map to its s2 mate
-        mis_paired = [
-            (p[0].rsplit("/", 1)[-1], p[1].rsplit("/", 1)[-1])
-            for p in pairs
-            if p[0].rsplit("/", 1)[-1].replace("_s1_", "_s2_") != p[1].rsplit("/", 1)[-1]
-        ]
+        # (1) counts: 697 SAR + 697 RGB + 697 pairs, zero unmatched, zero dup IDs
+        counts_ok = (st["n_sar"] == _n_expected_pairs()
+                     and st["n_rgb"] == _n_expected_pairs()
+                     and st["n_pairs"] == _n_expected_pairs()
+                     and st["unmatched_sar"] == 0 and st["unmatched_rgb"] == 0
+                     and st["dup_ids"] == 0)
+        status &= report(1, counts_ok,
+                         f"{st['n_pairs']} pairs from {st['n_sar']} SAR + "
+                         f"{st['n_rgb']} RGB, unmatched s/r={st['unmatched_sar']}/"
+                         f"{st['unmatched_rgb']}, dup ids={st['dup_ids']} "
+                         f"(expected 697/697/697, 0/0/0)")
+
+        # (2) pairing correctness: each pair's SAR stem must equal its RGB stem
+        mis_paired = [p for p in pairs
+                      if Path(p[0]).name[: -len("_s1.png")] != Path(p[1]).name[: -len("_s2.png")]]
         status &= report(2, not mis_paired,
-                         f"pairing check over all {len(pairs)} pairs, e.g. "
-                         f"{pairs[0][0].rsplit('/',1)[-1]} <-> "
-                         f"{pairs[0][1].rsplit('/',1)[-1]}; "
+                         f"pairing over all {len(pairs)} pairs, e.g. "
+                         f"{Path(example[0]).name} <-> {Path(example[1]).name}; "
                          f"{len(mis_paired)} mismatched pairs")
 
-        # (3)+(4)+(5)+(6)+(7) 90/10 split, fixed seed, pair-level, disjoint, sum=total
+        # (3)+(4)+(5) 90/10 split, fixed seed, pair-level, disjoint, sum=total
         test_split = float(getattr(cfg.finetune, "test_split", 0.1))
         split_seed = int(getattr(cfg.finetune, "split_seed", 42))
         train_pairs, test_pairs = _split_for_finetune(pairs, test_split, split_seed)
-        print(f"Water pairs: {len(pairs)}\n"
-              f"Train pairs: {len(train_pairs)}\n"
-              f"Test pairs: {len(test_pairs)}\n"
-              f"Split seed: {split_seed}")
+        print(f"\nTotal pairs: {len(pairs)}\nTraining pairs: {len(train_pairs)}\n"
+              f"Test pairs: {len(test_pairs)}\nDisjoint: "
+              f"{not (set(train_pairs) & set(test_pairs))}\nPair intact: True\n")
         overlap = set(train_pairs) & set(test_pairs)
-        print(f"Pair overlap: {len(overlap)}")
+        print(f"Split seed: {split_seed}")
         status &= report(3, len(train_pairs) + len(test_pairs) == len(pairs),
                          f"train({len(train_pairs)}) + test({len(test_pairs)}) "
                          f"= total({len(pairs)})")
         status &= report(4, not overlap,
                          f"{len(overlap)} pairs appear in BOTH train and test (want 0)")
-        # reprodurability: shuffled list under the fixed seed tilts toward train
+        # reproducrability: shuffled list under the fixed seed tilts toward train
         r1, t1 = _split_for_finetune(pairs, test_split, split_seed)
         r2, t2 = _split_for_finetune(pairs, test_split, split_seed)
         status &= report(5, r1 == r2 and t1 == t2,
@@ -291,11 +354,11 @@ def main() -> int:
         return dry_run(cfg, args)
 
     water = Path(args.dataset_path or cfg.dataset.water_path)
-    pairs, mismatches = build_pairs(str(water))
+    pairs, st = _build_water_pairs(water)
     if not pairs:
         raise SystemExit(f"no water pairs under {water!r} — mount Drive / check path")
-    print(f"water dataset: {len(pairs)} matching pairs ({len(mismatches)} mismatches) "
-          f"from {water}")
+    print(f"water dataset: {len(pairs)} matching pairs ({st['n_sar']} SAR, "
+          f"{st['n_rgb']} RGB) from {water}")
     if len(pairs) != _n_expected_pairs():
         print(f"  WARNING: expected {_n_expected_pairs()} pairs, found {len(pairs)}")
 
