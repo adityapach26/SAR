@@ -28,7 +28,7 @@ import torch
 
 import streamlit as st
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from utils.config_loader import load_config
 from scripts.pipeline import (
@@ -68,6 +68,20 @@ def _to_heat_pil(heat: np.ndarray) -> Image.Image:
     norm_ = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
     colored = cm.jet(norm_)[..., :3]  # (H, W, 3) in [0,1]
     return Image.fromarray((colored * 255).astype(np.uint8))
+
+
+def _display_image(image, caption: str) -> None:
+    img = Image.open(image) if isinstance(image, (str, Path)) else image
+    if isinstance(img, bytes):
+        from io import BytesIO
+        img = Image.open(BytesIO(img))
+    if isinstance(img, np.ndarray):
+        img = Image.fromarray(img)
+    img = img.convert("RGB") if img.mode not in ("RGB", "RGBA") else img
+    fitted = ImageOps.contain(img, (256, 256))
+    canvas = Image.new("RGBA" if fitted.mode == "RGBA" else "RGB", (256, 256), (11, 17, 23, 0) if fitted.mode == "RGBA" else (11, 17, 23))
+    canvas.paste(fitted, ((256 - fitted.width) // 2, (256 - fitted.height) // 2))
+    st.image(canvas, caption=caption, width=256)
 
 
 def _inject_css() -> None:
@@ -286,13 +300,13 @@ def _metric_cards(det_res, num_members: int) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="SAR.AI Command Center", layout="wide")
+    st.set_page_config(page_title="MARISAR Command Center", layout="wide")
     _inject_css()
     cfg = _load_config()
     dev = _device()
 
     with st.sidebar:
-        st.markdown('<div class="nav-title">SAR.AI NAVIGATION</div>', unsafe_allow_html=True)
+        st.markdown('<div class="nav-title">MARISAR NAVIGATION</div>', unsafe_allow_html=True)
         nav = st.radio(
             "Section",
             ["DASHBOARD", "DATA", "PRE-PROCESSING", "OBJECT DETECTION", "ANALYSIS", "SETTINGS"],
@@ -336,7 +350,7 @@ def main() -> None:
         <div class=\"command-header\">
             <div style=\"display:flex; justify-content:space-between; gap:1rem; align-items:flex-start; flex-wrap:wrap;\">
                 <div>
-                    <div class=\"brand\">SAR.AI</div>
+                    <div class=\"brand\">MARISAR</div>
                     <div class=\"title\">ADVANCED SYNTHETIC APERTURE RADAR ANALYTICS PLATFORM</div>
                     <div class=\"subtitle\">Maritime Intelligence • SAR Translation • Vessel Detection • Uncertainty Analysis</div>
                 </div>
@@ -370,7 +384,7 @@ def main() -> None:
         st.markdown(f'<span class="badge gold">FILE: {uploaded.name}</span>', unsafe_allow_html=True)
         if raw_dims is not None:
             st.markdown(f'<span class="badge">DIMENSIONS: {raw_dims[0]} × {raw_dims[1]}</span>', unsafe_allow_html=True)
-        st.image(raw, caption="Uploaded SAR preview", use_container_width=True)
+        _display_image(raw, "Uploaded SAR preview")
         _card_end()
 
     suffix = Path(uploaded.name).suffix or ".png"
@@ -414,8 +428,10 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         img_l, img_r = st.columns(2)
-        img_l.image(sar_pil, caption="RAW SAR INPUT", use_container_width=True)
-        img_r.image(rgb_pil, caption="TRANSLATED RGB", use_container_width=True)
+        with img_l:
+            _display_image(sar_pil, "RAW SAR INPUT")
+        with img_r:
+            _display_image(rgb_pil, "TRANSLATED RGB")
         _card_end()
 
     _card_start("3. CORE: OBJECT DETECTION", "Existing detector ensemble over the translated RGB output.")
@@ -443,10 +459,10 @@ def main() -> None:
                 '<div class="warning-state">No detections above the score threshold.</div>',
                 unsafe_allow_html=True,
             )
-            st.image(rgb_pil, caption="Detection panel idle — no boxes to render", use_container_width=True)
+            _display_image(rgb_pil, "Detection panel idle — no boxes to render")
         else:
             drawn = draw_detections(_numpy_rgb(rgb_01), dets)
-            st.image(drawn, caption="Detections (risk-colored)", use_container_width=True)
+            _display_image(drawn, "Detections (risk-colored)")
     with det_table_col:
         st.markdown('<div class="section-subtitle">Detection summary and compact detail table.</div>', unsafe_allow_html=True)
         if dets:
@@ -508,7 +524,7 @@ def main() -> None:
         _card_start("UNCERTAINTY", "Generator ensemble variance visualization.")
         if show_unc:
             hv = var_map[0].float().cpu().numpy()
-            st.image(_blend_heat(hv, rgb_pil), caption="Uncertainty heatmap overlaid (jet = higher uncertainty)", use_container_width=True)
+            _display_image(_blend_heat(hv, rgb_pil), "Uncertainty heatmap overlaid (jet = higher uncertainty)")
         else:
             st.markdown('<div class="info-state">Enable the uncertainty heatmap in Settings.</div>', unsafe_allow_html=True)
         _card_end()
@@ -523,7 +539,7 @@ def main() -> None:
                 heat = generator_gradcam(gen, sar, save=False).numpy()
                 gen_gc = _blend_heat(heat, rgb_pil)
         if gen_gc is not None:
-            st.image(gen_gc, caption="Generator Grad-CAM overlay", use_container_width=True)
+            _display_image(gen_gc, "Generator Grad-CAM overlay")
         else:
             st.markdown('<div class="info-state">Generator Grad-CAM is disabled in Settings.</div>', unsafe_allow_html=True)
 
@@ -546,7 +562,7 @@ def main() -> None:
                             raise
                         det_gc_msg = "No detections available for Detector Grad-CAM."
         if det_gc is not None:
-            st.image(det_gc, caption="Detector Grad-CAM overlay", use_container_width=True)
+            _display_image(det_gc, "Detector Grad-CAM overlay")
         else:
             st.markdown(f'<div class="info-state">{det_gc_msg}</div>', unsafe_allow_html=True)
         _card_end()
