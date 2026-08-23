@@ -263,6 +263,8 @@ def _inject_css() -> None:
             padding: 0.65rem;
         }
         .stDataFrame { border: 1px solid rgba(79,131,181,0.22); border-radius: 14px; overflow: hidden; }
+        div[data-testid="stImage"] { text-align: center; }
+        div[data-testid="stImage"] img { width: 256px !important; height: 256px !important; object-fit: contain; }
         h1, h2, h3 { color: var(--text); }
         </style>
         """,
@@ -317,23 +319,23 @@ def main() -> None:
             st.markdown(f'<div class="nav-item{active}">{item}</div>', unsafe_allow_html=True)
 
         st.divider()
-        st.markdown("### SETTINGS")
-        model_set = st.selectbox("Model Set", ["Agriculture", "Water Best", "Marine Best"])
-        st.caption("Marine Best = maritime-focused ensemble")
-        default_members = min(int(cfg.ensemble.num_members), 3)
-        num_members = st.number_input("Ensemble members", 1, 3, default_members)
-        ckpt_dir = st.text_input("Checkpoint dir", value=str(cfg.paths.checkpoint_dir))
-        st.caption("Real checkpoints live on Drive; override to ./checkpoints for local runs.")
+        with st.expander("Settings", expanded=False):
+            model_set = st.selectbox("Model Set", ["Agriculture", "Water Best", "Marine Best"])
+            st.caption("Marine Best = maritime-focused ensemble")
+            default_members = min(int(cfg.ensemble.num_members), 3)
+            num_members = st.number_input("Ensemble members", 1, 3, default_members)
+            ckpt_dir = st.text_input("Checkpoint dir", value=str(cfg.paths.checkpoint_dir))
+            st.caption("Real checkpoints live on Drive; override to ./checkpoints for local runs.")
 
-        st.markdown("#### Detection")
-        score_threshold = st.slider("Detection score threshold", 0.0, 1.0, 0.5, 0.05)
-        iou_thresh = st.slider("IoU merge threshold", 0.0, 1.0, 0.5, 0.05)
+            st.markdown("#### Detection")
+            score_threshold = st.slider("Detection score threshold", 0.0, 1.0, 0.5, 0.05)
+            iou_thresh = st.slider("IoU merge threshold", 0.0, 1.0, 0.5, 0.05)
 
-        st.markdown("#### Visualization")
-        show_unc = st.checkbox("Show generator-ensemble uncertainty heatmap")
-        show_grad_gen = st.checkbox("Show generator Grad-CAM")
-        show_grad_det = st.checkbox("Show detector Grad-CAM")
-        heatmap_opacity = st.slider("Heatmap opacity", 0.0, 1.0, 0.45, 0.05)
+            st.markdown("#### Visualization")
+            show_unc = st.checkbox("Show generator-ensemble uncertainty heatmap")
+            show_grad_gen = st.checkbox("Show generator Grad-CAM")
+            show_grad_det = st.checkbox("Show detector Grad-CAM")
+            heatmap_opacity = st.slider("Heatmap opacity", 0.0, 1.0, 0.45, 0.05)
 
     ckpt_dir = Path(ckpt_dir)
     num_members = int(num_members)
@@ -361,31 +363,28 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    top_left, top_right = st.columns([0.92, 1.08], gap="large")
-
-    with top_left:
-        _card_start("1. INPUT: SAR IMAGE LOAD", "Upload a SAR image for translation and detection.", gold=True)
-        uploaded = st.file_uploader("Upload SAR image", type=["png", "jpg", "jpeg", "tif", "tiff"])
-        st.caption("Accepted file types: PNG, JPG/JPEG, TIFF")
-        if uploaded is None:
-            st.markdown(
-                '<div class="empty-state">Awaiting SAR image upload. The inference pipeline will remain idle until a file is provided.</div>',
-                unsafe_allow_html=True,
-            )
-            _card_end()
-            return
-        raw = uploaded.getvalue()
-        try:
-            raw_img = Image.open(uploaded)
-            raw_dims = raw_img.size
-            uploaded.seek(0)
-        except Exception:
-            raw_dims = None
-        st.markdown(f'<span class="badge gold">FILE: {uploaded.name}</span>', unsafe_allow_html=True)
-        if raw_dims is not None:
-            st.markdown(f'<span class="badge">DIMENSIONS: {raw_dims[0]} × {raw_dims[1]}</span>', unsafe_allow_html=True)
-        _display_image(raw, "Uploaded SAR preview")
+    _card_start("1. INPUT: SAR", "Upload a SAR image for translation and detection.", gold=True)
+    uploaded = st.file_uploader("Upload SAR image", type=["png", "jpg", "jpeg", "tif", "tiff"])
+    st.caption("Accepted file types: PNG, JPG/JPEG, TIFF")
+    if uploaded is None:
+        st.markdown(
+            '<div class="empty-state">Awaiting SAR image upload. The inference pipeline will remain idle until a file is provided.</div>',
+            unsafe_allow_html=True,
+        )
         _card_end()
+        return
+    raw = uploaded.getvalue()
+    try:
+        raw_img = Image.open(uploaded)
+        raw_dims = raw_img.size
+        uploaded.seek(0)
+    except Exception:
+        raw_dims = None
+    _display_image(raw, "SAR INPUT")
+    st.markdown(f'<span class="badge gold">FILE: {uploaded.name}</span>', unsafe_allow_html=True)
+    if raw_dims is not None:
+        st.markdown(f'<span class="badge">DIMENSIONS: {raw_dims[0]} × {raw_dims[1]}</span>', unsafe_allow_html=True)
+    _card_end()
 
     suffix = Path(uploaded.name).suffix or ".png"
     tmp = Path(f"/tmp/sar_dash{suffix}")
@@ -413,28 +412,18 @@ def main() -> None:
         )  # mean_rgb (1,C,H,W)[-1,1]; var_map (1,H,W)
     rgb = mean_rgb[0]                       # (C,H,W) [-1,1]
     rgb_01 = ((rgb + 1.0).clamp(0, 1)) / 2.0  # -> [0,1] for the detector
-
-    sar_01 = ((sar + 1.0) / 2.0).clamp(0, 1)
-    if sar_01.shape[0] == 1:
-        sar_01 = sar_01.repeat(3, 1, 1)
-    sar_pil = Image.fromarray((_numpy_rgb(sar_01) * 255).astype(np.uint8))
     rgb_pil = Image.fromarray((_numpy_rgb(rgb_01) * 255).astype(np.uint8))
 
-    with top_right:
-        _card_start("2. PRE-PROCESSING: SAR → RGB", "Generator ensemble translation with selected checkpoint set.")
-        st.markdown(
-            f'<span class="badge gold">MODEL SET: {model_set}</span> '
-            f'<span class="badge">ENSEMBLE MEMBERS: {num_members}</span>',
-            unsafe_allow_html=True,
-        )
-        img_l, img_r = st.columns(2)
-        with img_l:
-            _display_image(sar_pil, "RAW SAR INPUT")
-        with img_r:
-            _display_image(rgb_pil, "TRANSLATED RGB")
-        _card_end()
+    _card_start("2. SAR → RGB TRANSLATION", "Generator ensemble translation with the selected checkpoint set.")
+    st.markdown(
+        f'<span class="badge gold">MODEL SET: {model_set}</span> '
+        f'<span class="badge">ENSEMBLE MEMBERS: {num_members}</span>',
+        unsafe_allow_html=True,
+    )
+    _display_image(rgb_pil, "GENERATED RGB")
+    _card_end()
 
-    _card_start("3. CORE: OBJECT DETECTION", "Existing detector ensemble over the translated RGB output.")
+    _card_start("3. OBJECT DETECTION", "Existing detector ensemble over the translated RGB output.")
     st.markdown(
         f'<span class="badge">SCORE THRESHOLD: {score_threshold:.2f}</span> '
         f'<span class="badge">IOU MERGE: {iou_thresh:.2f}</span> '
@@ -450,37 +439,16 @@ def main() -> None:
         iou_thresh=iou_thresh,
     )
     dets = det_res["merged"]
+    if not dets:
+        st.markdown(
+            '<div class="warning-state">No detections above the score threshold.</div>',
+            unsafe_allow_html=True,
+        )
+        _display_image(rgb_pil, "DETECTION RESULT")
+    else:
+        drawn = draw_detections(_numpy_rgb(rgb_01), dets)
+        _display_image(drawn, "DETECTION RESULT")
     _metric_cards(det_res, num_members)
-
-    det_img_col, det_table_col = st.columns([1.42, 0.58], gap="large")
-    with det_img_col:
-        if not dets:
-            st.markdown(
-                '<div class="warning-state">No detections above the score threshold.</div>',
-                unsafe_allow_html=True,
-            )
-            _display_image(rgb_pil, "Detection panel idle — no boxes to render")
-        else:
-            drawn = draw_detections(_numpy_rgb(rgb_01), dets)
-            _display_image(drawn, "Detections (risk-colored)")
-    with det_table_col:
-        st.markdown('<div class="section-subtitle">Detection summary and compact detail table.</div>', unsafe_allow_html=True)
-        if dets:
-            with st.expander("Detection detail table", expanded=True):
-                st.dataframe(
-                    [
-                        {
-                            "score": round(d["score"], 3),
-                            "uncertainty": round(d["uncertainty"], 4),
-                            "models": d["count"],
-                            "risk": risk_color(d["score"], d["uncertainty"]),
-                        }
-                        for d in dets
-                    ],
-                    use_container_width=True,
-                )
-        else:
-            st.markdown('<div class="info-state">No detection rows to display.</div>', unsafe_allow_html=True)
     _card_end()
 
     def _blend_heat(heat: np.ndarray, base: Image.Image) -> Image.Image:
@@ -489,13 +457,73 @@ def main() -> None:
         base_rgba = base.convert("RGBA")
         return Image.blend(base_rgba, heat_rgba, heatmap_opacity).convert("RGB")
 
+    st.markdown('<div class="section-title">4. ANALYSIS</div><div class="section-subtitle">Uncertainty and Grad-CAM outputs from the existing analysis utilities.</div>', unsafe_allow_html=True)
     analysis_l, analysis_c, analysis_r = st.columns([1.0, 1.0, 1.0], gap="large")
 
     with analysis_l:
-        _card_start("4. OUTPUT & ANALYSIS", "Risk color-coding and failure-mode status.", gold=True)
-        if not dets:
-            st.markdown('<div class="info-state">No detections to color.</div>', unsafe_allow_html=True)
+        _card_start("UNCERTAINTY", "Generator ensemble variance visualization.")
+        if show_unc:
+            hv = var_map[0].float().cpu().numpy()
+            _display_image(_blend_heat(hv, rgb_pil), "UNCERTAINTY")
         else:
+            st.markdown('<div class="info-state">Enable the uncertainty heatmap in Settings.</div>', unsafe_allow_html=True)
+        _card_end()
+
+    with analysis_c:
+        _card_start("GENERATOR GRAD-CAM", "Generator Grad-CAM overlay from existing utilities.")
+        gen_gc = None
+        if show_grad_gen:
+            with st.spinner("Building generator Grad-CAM…"):
+                gen = generator_from_config(cfg, dev).eval()
+                gen.load_state_dict(torch.load(first_generator_checkpoint, map_location=dev))
+                heat = generator_gradcam(gen, sar, save=False).numpy()
+                gen_gc = _blend_heat(heat, rgb_pil)
+        if gen_gc is not None:
+            _display_image(gen_gc, "GENERATOR GRAD-CAM")
+        else:
+            st.markdown('<div class="info-state">Generator Grad-CAM is disabled in Settings.</div>', unsafe_allow_html=True)
+        _card_end()
+
+    with analysis_r:
+        _card_start("DETECTOR GRAD-CAM", "Detector Grad-CAM overlay from existing utilities.")
+        det_gc = None
+        det_gc_msg = "Detector Grad-CAM is disabled in Settings."
+        if show_grad_det:
+            if not dets:
+                det_gc_msg = "No detections available for Detector Grad-CAM."
+            else:
+                with st.spinner("Building detector Grad-CAM…"):
+                    det = detector_from_config(cfg, dev).eval()
+                    det.load_state_dict(torch.load(
+                        ckpt_dir / f"detector_seed{cfg.ensemble.seeds[0]}.pt",
+                        map_location=dev))
+                    try:
+                        heat, score = detector_gradcam(det, rgb_01, save=False)
+                        det_gc = _blend_heat(heat.numpy(), rgb_pil)
+                    except RuntimeError as e:
+                        if "detector found no detections" not in str(e):
+                            raise
+                        det_gc_msg = "No detections available for Detector Grad-CAM."
+        if det_gc is not None:
+            _display_image(det_gc, "DETECTOR GRAD-CAM")
+        else:
+            st.markdown(f'<div class="info-state">{det_gc_msg}</div>', unsafe_allow_html=True)
+        _card_end()
+
+    with st.expander("Detection status and failure analysis", expanded=False):
+        if dets:
+            st.dataframe(
+                [
+                    {
+                        "score": round(d["score"], 3),
+                        "uncertainty": round(d["uncertainty"], 4),
+                        "models": d["count"],
+                        "risk": risk_color(d["score"], d["uncertainty"]),
+                    }
+                    for d in dets
+                ],
+                use_container_width=True,
+            )
             boxes = [d["box"] for d in dets]
             metric_boxes = boxes
             txt = failure_text(_numpy_rgb(rgb_01), metric_boxes)
@@ -518,54 +546,8 @@ def main() -> None:
                 )
             else:
                 st.markdown('<div class="info-state">All detections green — no amber/red case to explain here.</div>', unsafe_allow_html=True)
-        _card_end()
-
-    with analysis_c:
-        _card_start("UNCERTAINTY", "Generator ensemble variance visualization.")
-        if show_unc:
-            hv = var_map[0].float().cpu().numpy()
-            _display_image(_blend_heat(hv, rgb_pil), "Uncertainty heatmap overlaid (jet = higher uncertainty)")
         else:
-            st.markdown('<div class="info-state">Enable the uncertainty heatmap in Settings.</div>', unsafe_allow_html=True)
-        _card_end()
-
-    with analysis_r:
-        _card_start("EXPLAINABILITY", "Grad-CAM overlays from existing utilities.")
-        gen_gc = None
-        if show_grad_gen:
-            with st.spinner("Building generator Grad-CAM…"):
-                gen = generator_from_config(cfg, dev).eval()
-                gen.load_state_dict(torch.load(first_generator_checkpoint, map_location=dev))
-                heat = generator_gradcam(gen, sar, save=False).numpy()
-                gen_gc = _blend_heat(heat, rgb_pil)
-        if gen_gc is not None:
-            _display_image(gen_gc, "Generator Grad-CAM overlay")
-        else:
-            st.markdown('<div class="info-state">Generator Grad-CAM is disabled in Settings.</div>', unsafe_allow_html=True)
-
-        det_gc = None
-        det_gc_msg = "Detector Grad-CAM is disabled in Settings."
-        if show_grad_det:
-            if not dets:
-                det_gc_msg = "No detections available for Detector Grad-CAM."
-            else:
-                with st.spinner("Building detector Grad-CAM…"):
-                    det = detector_from_config(cfg, dev).eval()
-                    det.load_state_dict(torch.load(
-                        ckpt_dir / f"detector_seed{cfg.ensemble.seeds[0]}.pt",
-                        map_location=dev))
-                    try:
-                        heat, score = detector_gradcam(det, rgb_01, save=False)
-                        det_gc = _blend_heat(heat.numpy(), rgb_pil)
-                    except RuntimeError as e:
-                        if "detector found no detections" not in str(e):
-                            raise
-                        det_gc_msg = "No detections available for Detector Grad-CAM."
-        if det_gc is not None:
-            _display_image(det_gc, "Detector Grad-CAM overlay")
-        else:
-            st.markdown(f'<div class="info-state">{det_gc_msg}</div>', unsafe_allow_html=True)
-        _card_end()
+            st.markdown('<div class="info-state">No detection rows to display.</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":  # Colab/streamlit run only.
