@@ -37,6 +37,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.config_loader import load_config            # noqa: E402
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
 from data.dataset import SEN12Dataset                  # noqa: E402
 from scripts.train import train_generator              # noqa: E402
 from models.generator import Generator                 # noqa: E402
@@ -48,8 +50,17 @@ def _device():
 
 
 def _n_expected_pairs() -> int:
-    """697 paired images is what the water dataset ships with."""
+    """697 paired images is what the original water dataset ships with."""
     return 697
+
+
+def _n_expected_m4sar_pairs() -> int:
+    """1569 paired images is what the M4-SAR harbor subset ships with."""
+    return 1569
+
+
+def _n_expected_combined_pairs() -> int:
+    return _n_expected_pairs() + _n_expected_m4sar_pairs()
 
 
 def _build_water_pairs(water_dir):
@@ -126,6 +137,57 @@ def _split_for_finetune(pairs, test_split: float, split_seed: int):
     return train, test
 
 
+def _pair_id(pair):
+    return Path(pair[0]).name[: -len("_s1.png")]
+
+
+def _tag_pairs(pairs, source):
+    return [{"pair": p, "source": source, "id": _pair_id(p)} for p in pairs]
+
+
+def _default_m4sar_path(water_path: Path) -> Path:
+    return water_path.parent / "water_m4sar_harbor"
+
+
+def _is_combined_request(path: Path) -> bool:
+    return path.name == "water_combined"
+
+
+def _build_balanced_loader(cfg, tagged_train, batch_size):
+    pairs = [x["pair"] for x in tagged_train]
+    sources = [x["source"] for x in tagged_train]
+    counts = {s: sources.count(s) for s in sorted(set(sources))}
+    weights = [1.0 / counts[s] for s in sources]
+    ds = SEN12Dataset(
+        pairs,
+        num_channels=int(cfg.input_channels.num_channels),
+        texture_kernel_size=int(cfg.input_channels.texture_kernel_size),
+    )
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size or int(cfg.finetune.batch_size),
+        sampler=sampler,
+        num_workers=int(cfg.train.num_workers),
+        pin_memory=True,
+        drop_last=False,
+    )
+    source_weights = {s: 1.0 / counts[s] for s in counts}
+    return loader, source_weights
+
+
+def _sampler_source_fraction(tagged_train) -> tuple[float, float]:
+    sources = [x["source"] for x in tagged_train]
+    counts = {s: sources.count(s) for s in sorted(set(sources))}
+    masses = {s: counts[s] * (1.0 / counts[s]) for s in counts}
+    total = sum(masses.values())
+    return masses.get("original", 0.0) / total, masses.get("m4sar", 0.0) / total
+
+
 def _parse_args():
     ap = argparse.ArgumentParser(
         description="Fine-tune the trained agriculture SAR->RGB model on the water dataset.")
@@ -134,7 +196,9 @@ def _parse_args():
                          "fine-tune bootstraps from the agriculture seed1_latest.pt "
                          "you own (override for other seeds).")
     ap.add_argument("--dataset-path", default=None,
-                    help="Water dataset root (default: config.dataset.water_path)")
+                    help="Water dataset root (default: config.dataset.water_path). Use a path named water_combined for the marine experiment.")
+    ap.add_argument("--m4sar-path", default=None,
+                    help="M4-SAR harbor root for water_combined (default: sibling water_m4sar_harbor)")
     ap.add_argument("--init-checkpoint", default=None,
                     help="Agriculture checkpoint to bootstrap from "
                          "(default: <checkpoint_dir>/seed{seed}_latest.pt)")
@@ -182,13 +246,15 @@ def dry_run(cfg, args):
     device = _device()
     seed = args.seed if args.seed is not None else 1
     water = Path(args.dataset_path or cfg.dataset.water_path)
-    base_name = f"water_finetune_seed{seed}"
+    marine_mode = _is_combined_request(water)
+    base_name = f"water_marine_seed{seed}" if marine_mode else f"water_finetune_seed{seed}"
     init_ckpt = Path(args.init_checkpoint or Path(cfg.paths.checkpoint_dir) / f"seed{seed}_latest.pt")
-    out_ckpt = Path(args.output or Path(cfg.paths.checkpoint_dir) / f"water_finetune_seed{seed}.pt")
+    out_ckpt = Path(args.output or Path(cfg.paths.checkpoint_dir) / f"{base_name}.pt")
     latest_out = Path(cfg.paths.checkpoint_dir) / f"{base_name}_latest.pt"
     best_out = Path(cfg.paths.checkpoint_dir) / f"{base_name}_best.pt"
     agri_latest = Path(cfg.paths.checkpoint_dir) / f"seed{seed}_latest.pt"
-    water_ckpt_paths = (latest_out, out_ckpt, best_out)
+    water_best_paths = tuple(Path(cfg.paths.checkpoint_dir) / f"water_finetune_seed{s}_best.pt" for s in (1, 2, 3))
+    water_ckpt_paths = (latest_out, out_ckpt, best_out, *water_best_paths)
     before_stats = {p: p.stat().st_mtime_ns if p.exists() else None for p in water_ckpt_paths}
 
     sar_channels = int(cfg.input_channels.num_channels)
@@ -200,77 +266,136 @@ def dry_run(cfg, args):
 
     status = True
 
-    # (1)+(2) water dataset loads & s1/s2 folder pairing (only checkable on Drive)
-    print(f"\nWater dataset path: {water}")
-    if water.is_dir():
-        pairs, st = _build_water_pairs(water)
-        if not pairs:
-            # never descend into index-based pairing when nothing was found
-            print("[1] FAIL: no matching water pairs found (mount Drive? wrong path?)")
-            return 1
-        print(f"SAR files: {st['n_sar']}\nRGB files: {st['n_rgb']}\n"
-              f"Matching pairs: {st['n_pairs']}\nUnmatched SAR: {st['unmatched_sar']}\n"
-              f"Unmatched RGB: {st['unmatched_rgb']}\nDuplicate pair IDs: {st['dup_ids']}")
-        example = pairs[0]
-        print(f"Example pair:\n{Path(example[0]).name} <-> {Path(example[1]).name}")
-
-        # (1) counts: 697 SAR + 697 RGB + 697 pairs, zero unmatched, zero dup IDs
-        counts_ok = (st["n_sar"] == _n_expected_pairs()
-                     and st["n_rgb"] == _n_expected_pairs()
-                     and st["n_pairs"] == _n_expected_pairs()
-                     and st["unmatched_sar"] == 0 and st["unmatched_rgb"] == 0
-                     and st["dup_ids"] == 0)
-        status &= report(1, counts_ok,
-                         f"{st['n_pairs']} pairs from {st['n_sar']} SAR + "
-                         f"{st['n_rgb']} RGB, unmatched s/r={st['unmatched_sar']}/"
-                         f"{st['unmatched_rgb']}, dup ids={st['dup_ids']} "
-                         f"(expected 697/697/697, 0/0/0)")
-
-        # (2) pairing correctness: each pair's SAR stem must equal its RGB stem
-        mis_paired = [p for p in pairs
-                      if Path(p[0]).name[: -len("_s1.png")] != Path(p[1]).name[: -len("_s2.png")]]
-        status &= report(2, not mis_paired,
-                         f"pairing over all {len(pairs)} pairs, e.g. "
-                         f"{Path(example[0]).name} <-> {Path(example[1]).name}; "
-                         f"{len(mis_paired)} mismatched pairs")
-
-        # (3)+(4)+(5) 90/10 split, fixed seed, pair-level, disjoint, sum=total
-        test_split = float(getattr(cfg.finetune, "test_split", 0.1))
-        split_seed = int(getattr(cfg.finetune, "split_seed", 42))
-        train_pairs, test_pairs = _split_for_finetune(pairs, test_split, split_seed)
-        print(f"\nTotal pairs: {len(pairs)}\nTraining pairs: {len(train_pairs)}\n"
-              f"Test pairs: {len(test_pairs)}\nDisjoint: "
-              f"{not (set(train_pairs) & set(test_pairs))}\nPair intact: True\n")
-        overlap = set(train_pairs) & set(test_pairs)
-        print(f"Split seed: {split_seed}")
-        status &= report(3, len(train_pairs) + len(test_pairs) == len(pairs),
-                         f"train({len(train_pairs)}) + test({len(test_pairs)}) "
-                         f"= total({len(pairs)})")
-        status &= report(4, not overlap,
-                         f"{len(overlap)} pairs appear in BOTH train and test (want 0)")
-        # reproducrability: shuffled list under the fixed seed tilts toward train
-        r1, t1 = _split_for_finetune(pairs, test_split, split_seed)
-        r2, t2 = _split_for_finetune(pairs, test_split, split_seed)
-        status &= report(5, r1 == r2 and t1 == t2,
-                         f"split reproducible (same {len(r1)} train / {len(t1)} test "
-                         f"on rerun)")
-
-        ds = SEN12Dataset(pairs, num_channels=sar_channels,
-                          texture_kernel_size=int(cfg.input_channels.texture_kernel_size))
-        sar_t, rgb_t = ds[0]
-        # (6) water SAR passes through channel-stack -> (3,H,W) in [-1,1]
-        c3 = (sar_t.shape[0] == sar_channels and sar_t.ndim == 3
-              and float(sar_t.min()) >= -1.01 and float(sar_t.max()) <= 1.01
-              and sar_t.shape[-1] == int(cfg.dataset.image_size))
-        status &= report(6, c3,
-                         f"SAR channel-stack -> {tuple(sar_t.shape)} in [-1,1]")
+    if marine_mode:
+        original_dir = Path(cfg.dataset.water_path)
+        m4sar_dir = Path(args.m4sar_path) if args.m4sar_path else _default_m4sar_path(original_dir)
+        print(f"\nOriginal water dataset path: {original_dir}")
+        print(f"M4-SAR harbor dataset path: {m4sar_dir}")
+        if original_dir.is_dir() and m4sar_dir.is_dir():
+            original_pairs, st_o = _build_water_pairs(original_dir)
+            m4sar_pairs, st_m = _build_water_pairs(m4sar_dir)
+            original_ids = {_pair_id(p) for p in original_pairs}
+            m4sar_ids = {_pair_id(p) for p in m4sar_pairs}
+            overlap_ids = original_ids & m4sar_ids
+            if overlap_ids:
+                print(f"[duplicate] overlapping final pair IDs: {sorted(overlap_ids)[:10]}")
+            tagged = _tag_pairs(original_pairs, "original") + _tag_pairs(m4sar_pairs, "m4sar")
+            train_tagged, test_tagged = _split_for_finetune(
+                tagged,
+                float(getattr(cfg.finetune, "test_split", 0.1)),
+                int(getattr(cfg.finetune, "split_seed", 42)),
+            )
+            train_pairs = [x["pair"] for x in train_tagged]
+            test_pairs = [x["pair"] for x in test_tagged]
+            print(f"Original water pairs available: {len(original_pairs)}")
+            print(f"M4-SAR pairs available: {len(m4sar_pairs)}")
+            print(f"Combined pairs: {len(tagged)}")
+            print(f"Training pairs after 90/10 split: {len(train_tagged)}")
+            print(f"Held-out test pairs: {len(test_tagged)}")
+            status &= report(1, st_o["n_sar"] == _n_expected_pairs() and st_o["n_rgb"] == _n_expected_pairs()
+                             and st_o["n_pairs"] == _n_expected_pairs()
+                             and st_o["unmatched_sar"] == 0 and st_o["unmatched_rgb"] == 0,
+                             f"original water {st_o['n_sar']} SAR / {st_o['n_rgb']} RGB / {st_o['n_pairs']} pairs")
+            status &= report(2, st_m["n_sar"] == _n_expected_m4sar_pairs() and st_m["n_rgb"] == _n_expected_m4sar_pairs()
+                             and st_m["n_pairs"] == _n_expected_m4sar_pairs()
+                             and st_m["unmatched_sar"] == 0 and st_m["unmatched_rgb"] == 0,
+                             f"M4-SAR {st_m['n_sar']} SAR / {st_m['n_rgb']} RGB / {st_m['n_pairs']} pairs")
+            status &= report(3, len(tagged) == _n_expected_combined_pairs() and not overlap_ids,
+                             f"{len(tagged)} combined unique pairs, duplicate final IDs={len(overlap_ids)}")
+            status &= report(4, len(original_pairs) == _n_expected_pairs() and len(m4sar_pairs) == _n_expected_m4sar_pairs(),
+                             f"source identity original={len(original_pairs)} m4sar={len(m4sar_pairs)}")
+            overlap = set(train_pairs) & set(test_pairs)
+            r1, t1 = _split_for_finetune(tagged, float(getattr(cfg.finetune, "test_split", 0.1)), int(getattr(cfg.finetune, "split_seed", 42)))
+            r2, t2 = _split_for_finetune(tagged, float(getattr(cfg.finetune, "test_split", 0.1)), int(getattr(cfg.finetune, "split_seed", 42)))
+            status &= report(5, len(train_tagged) + len(test_tagged) == len(tagged) and not overlap and r1 == r2 and t1 == t2,
+                             f"train({len(train_tagged)}) + test({len(test_tagged)}) = {len(tagged)}, overlap={len(overlap)}, split_seed={getattr(cfg.finetune, 'split_seed', 42)}")
+            mis_paired = [x for x in tagged if Path(x["pair"][0]).name[: -len("_s1.png")] != Path(x["pair"][1]).name[: -len("_s2.png")]]
+            status &= report(6, not mis_paired, f"pair intact for {len(tagged)} combined pairs; mismatches={len(mis_paired)}")
+            _, source_weights = _build_balanced_loader(cfg, train_tagged, args.batch_size or int(cfg.finetune.batch_size))
+            frac_o, frac_m = _sampler_source_fraction(train_tagged)
+            print("Balanced training sampler:")
+            print(f"Original source weight: {source_weights.get('original')}")
+            print(f"M4-SAR source weight: {source_weights.get('m4sar')}")
+            status &= report(7, abs(frac_o - 0.5) <= 0.01 and abs(frac_m - 0.5) <= 0.01,
+                             f"expected source exposure original={frac_o:.3f}, m4sar={frac_m:.3f}")
+            ds = SEN12Dataset(train_pairs, num_channels=sar_channels,
+                              texture_kernel_size=int(cfg.input_channels.texture_kernel_size))
+            sar_t, rgb_t = ds[0]
+            c3 = (sar_t.shape[0] == sar_channels and sar_t.ndim == 3
+                  and float(sar_t.min()) >= -1.01 and float(sar_t.max()) <= 1.01
+                  and sar_t.shape[-1] == int(cfg.dataset.image_size))
+            status &= report(8, c3, f"SAR channel-stack -> {tuple(sar_t.shape)} in [-1,1]")
+            pairs = train_pairs
+        else:
+            print("[1..8] RUN ON COLAB: original water and M4-SAR paths must be mounted to verify combined data.")
+            pairs = None
+            sar_t = rgb_t = None
     else:
-        print(f"[1] RUN ON COLAB: water path not mounted here — "
-              f"verify {_n_expected_pairs()} pairs on Drive.")
-        print("[2] RUN ON COLAB: pairing check uses real Drive data.")
-        print("[3..5,6] RUN ON COLAB: 90/10 split + channel-stack checks use real Drive data.")
-        pairs = None
-        sar_t = rgb_t = None
+        # (1)+(2) water dataset loads & s1/s2 folder pairing (only checkable on Drive)
+        print(f"\nWater dataset path: {water}")
+        if water.is_dir():
+            pairs, st = _build_water_pairs(water)
+            if not pairs:
+                print("[1] FAIL: no matching water pairs found (mount Drive? wrong path?)")
+                return 1
+            print(f"SAR files: {st['n_sar']}\nRGB files: {st['n_rgb']}\n"
+                  f"Matching pairs: {st['n_pairs']}\nUnmatched SAR: {st['unmatched_sar']}\n"
+                  f"Unmatched RGB: {st['unmatched_rgb']}\nDuplicate pair IDs: {st['dup_ids']}")
+            example = pairs[0]
+            print(f"Example pair:\n{Path(example[0]).name} <-> {Path(example[1]).name}")
+
+            counts_ok = (st["n_sar"] == _n_expected_pairs()
+                         and st["n_rgb"] == _n_expected_pairs()
+                         and st["n_pairs"] == _n_expected_pairs()
+                         and st["unmatched_sar"] == 0 and st["unmatched_rgb"] == 0
+                         and st["dup_ids"] == 0)
+            status &= report(1, counts_ok,
+                             f"{st['n_pairs']} pairs from {st['n_sar']} SAR + "
+                             f"{st['n_rgb']} RGB, unmatched s/r={st['unmatched_sar']}/"
+                             f"{st['unmatched_rgb']}, dup ids={st['dup_ids']} "
+                             f"(expected 697/697/697, 0/0/0)")
+
+            mis_paired = [p for p in pairs
+                          if Path(p[0]).name[: -len("_s1.png")] != Path(p[1]).name[: -len("_s2.png")]]
+            status &= report(2, not mis_paired,
+                             f"pairing over all {len(pairs)} pairs, e.g. "
+                             f"{Path(example[0]).name} <-> {Path(example[1]).name}; "
+                             f"{len(mis_paired)} mismatched pairs")
+
+            test_split = float(getattr(cfg.finetune, "test_split", 0.1))
+            split_seed = int(getattr(cfg.finetune, "split_seed", 42))
+            train_pairs, test_pairs = _split_for_finetune(pairs, test_split, split_seed)
+            print(f"\nTotal pairs: {len(pairs)}\nTraining pairs: {len(train_pairs)}\n"
+                  f"Test pairs: {len(test_pairs)}\nDisjoint: "
+                  f"{not (set(train_pairs) & set(test_pairs))}\nPair intact: True\n")
+            overlap = set(train_pairs) & set(test_pairs)
+            print(f"Split seed: {split_seed}")
+            status &= report(3, len(train_pairs) + len(test_pairs) == len(pairs),
+                             f"train({len(train_pairs)}) + test({len(test_pairs)}) "
+                             f"= total({len(pairs)})")
+            status &= report(4, not overlap,
+                             f"{len(overlap)} pairs appear in BOTH train and test (want 0)")
+            r1, t1 = _split_for_finetune(pairs, test_split, split_seed)
+            r2, t2 = _split_for_finetune(pairs, test_split, split_seed)
+            status &= report(5, r1 == r2 and t1 == t2,
+                             f"split reproducible (same {len(r1)} train / {len(t1)} test "
+                             f"on rerun)")
+
+            ds = SEN12Dataset(pairs, num_channels=sar_channels,
+                              texture_kernel_size=int(cfg.input_channels.texture_kernel_size))
+            sar_t, rgb_t = ds[0]
+            c3 = (sar_t.shape[0] == sar_channels and sar_t.ndim == 3
+                  and float(sar_t.min()) >= -1.01 and float(sar_t.max()) <= 1.01
+                  and sar_t.shape[-1] == int(cfg.dataset.image_size))
+            status &= report(6, c3,
+                             f"SAR channel-stack -> {tuple(sar_t.shape)} in [-1,1]")
+        else:
+            print(f"[1] RUN ON COLAB: water path not mounted here — "
+                  f"verify {_n_expected_pairs()} pairs on Drive.")
+            print("[2] RUN ON COLAB: pairing check uses real Drive data.")
+            print("[3..5,6] RUN ON COLAB: 90/10 split + channel-stack checks use real Drive data.")
+            pairs = None
+            sar_t = rgb_t = None
 
     # (7)+(8) generator & discriminator accept the tensors
     if pairs is None:  # synthetic fallback (local)
@@ -360,47 +485,77 @@ def main() -> int:
         return dry_run(cfg, args)
 
     water = Path(args.dataset_path or cfg.dataset.water_path)
-    pairs, st = _build_water_pairs(water)
-    if not pairs:
-        raise SystemExit(f"no water pairs under {water!r} — mount Drive / check path")
-    print(f"water dataset: {len(pairs)} matching pairs ({st['n_sar']} SAR, "
-          f"{st['n_rgb']} RGB) from {water}")
-    if len(pairs) != _n_expected_pairs():
-        print(f"  WARNING: expected {_n_expected_pairs()} pairs, found {len(pairs)}")
-
-    # Deterministic 90/10 pair-level split; fixed split_seed (42), independent of
-    # the model seed, so seeds 1/2/3 all use the SAME water train/test split.
+    marine_mode = _is_combined_request(water)
     test_split = float(getattr(cfg.finetune, "test_split", 0.1))
     split_seed = int(getattr(cfg.finetune, "split_seed", 42))
-    train_pairs, test_pairs = _split_for_finetune(pairs, test_split, split_seed)
-    print(f"Water pairs: {len(pairs)} | Train: {len(train_pairs)} | "
-          f"Test: {len(test_pairs)} | Split seed: {split_seed}")
-    assert set(train_pairs).isdisjoint(test_pairs), "train/test must be disjoint"
+    batch = args.batch_size or int(cfg.finetune.batch_size)
 
-    output = args.output or str(ckpt_dir / f"water_finetune_seed{seed}.pt")
-    best_output = ckpt_dir / f"water_finetune_seed{seed}_best.pt"
+    if marine_mode:
+        original_dir = Path(cfg.dataset.water_path)
+        m4sar_dir = Path(args.m4sar_path) if args.m4sar_path else _default_m4sar_path(original_dir)
+        original_pairs, st_o = _build_water_pairs(original_dir)
+        m4sar_pairs, st_m = _build_water_pairs(m4sar_dir)
+        if not original_pairs or not m4sar_pairs:
+            raise SystemExit(f"missing marine source pairs: original={len(original_pairs)} m4sar={len(m4sar_pairs)}")
+        original_ids = {_pair_id(p) for p in original_pairs}
+        m4sar_ids = {_pair_id(p) for p in m4sar_pairs}
+        overlap_ids = original_ids & m4sar_ids
+        if overlap_ids:
+            raise SystemExit(f"duplicate pair IDs across sources: {sorted(overlap_ids)[:10]}")
+        tagged = _tag_pairs(original_pairs, "original") + _tag_pairs(m4sar_pairs, "m4sar")
+        train_tagged, test_tagged = _split_for_finetune(tagged, test_split, split_seed)
+        train_pairs = [x["pair"] for x in train_tagged]
+        test_pairs = [x["pair"] for x in test_tagged]
+        train_loader, source_weights = _build_balanced_loader(cfg, train_tagged, batch)
+        frac_o, frac_m = _sampler_source_fraction(train_tagged)
+        print(f"Original water pairs available: {len(original_pairs)}")
+        print(f"M4-SAR pairs available: {len(m4sar_pairs)}")
+        print(f"Combined pairs: {len(tagged)}")
+        print(f"Training pairs after 90/10 split: {len(train_tagged)}")
+        print(f"Held-out test pairs: {len(test_tagged)}")
+        print("Balanced training sampler:")
+        print(f"Original source weight: {source_weights.get('original')}")
+        print(f"M4-SAR source weight: {source_weights.get('m4sar')}")
+        print(f"Expected source exposure: original={frac_o:.3f}, m4sar={frac_m:.3f}")
+        assert set(train_pairs).isdisjoint(test_pairs), "train/test must be disjoint"
+        base_name = f"water_marine_seed{seed}"
+        train_input = train_loader
+    else:
+        pairs, st = _build_water_pairs(water)
+        if not pairs:
+            raise SystemExit(f"no water pairs under {water!r} — mount Drive / check path")
+        print(f"water dataset: {len(pairs)} matching pairs ({st['n_sar']} SAR, "
+              f"{st['n_rgb']} RGB) from {water}")
+        if len(pairs) != _n_expected_pairs():
+            print(f"  WARNING: expected {_n_expected_pairs()} pairs, found {len(pairs)}")
+        train_pairs, test_pairs = _split_for_finetune(pairs, test_split, split_seed)
+        print(f"Water pairs: {len(pairs)} | Train: {len(train_pairs)} | "
+              f"Test: {len(test_pairs)} | Split seed: {split_seed}")
+        assert set(train_pairs).isdisjoint(test_pairs), "train/test must be disjoint"
+        base_name = f"water_finetune_seed{seed}"
+        train_input = train_pairs
+
+    output = args.output or str(ckpt_dir / f"{base_name}.pt")
+    best_output = ckpt_dir / f"{base_name}_best.pt"
     init = args.init_checkpoint or str(ckpt_dir / f"seed{seed}_latest.pt")
     if not Path(init).exists():
         raise SystemExit(f"init checkpoint not found: {init} — cannot fine-tune from scratch")
 
-    # bootstrap from seed1_latest.pt (read-only), fresh lower-lr optimizers
-    # (LR = 5e-5), ~10 epochs, water TRAIN split (90%) only for gradient updates;
-    # held-out test split (10%) evaluated per-epoch (forward-only).
     train_generator(
         seed=seed,
         config=cfg,
         output_checkpoint_path=output,
-        train_split=train_pairs,
+        train_split=train_input,
         init_checkpoint=init,
         lr=best,
-        checkpoint_name=f"water_finetune_seed{seed}",
-        batch_size=args.batch_size or int(cfg.finetune.batch_size),
+        checkpoint_name=base_name,
+        batch_size=batch,
         num_epochs=args.epochs or int(cfg.finetune.num_epochs),
         eval_split=test_pairs,
         best_checkpoint_path=best_output,
         reset_from_init=args.reset_from_agri,
     )
-    print(f"\n[DONE] water-finetuned generator -> {output}  "
+    print(f"\n[DONE] water fine-tuned generator -> {output}  "
           f"(agriculture seed{seed}_latest.pt untouched)")
     return 0
 
