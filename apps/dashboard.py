@@ -304,7 +304,8 @@ def main() -> None:
 
         st.divider()
         st.markdown("### SETTINGS")
-        model_set = st.selectbox("Model set", ["Agriculture", "Water Best"])
+        model_set = st.selectbox("Model Set", ["Agriculture", "Water Best", "Marine Best"])
+        st.caption("Marine Best = maritime-focused ensemble")
         default_members = min(int(cfg.ensemble.num_members), 3)
         num_members = st.number_input("Ensemble members", 1, 3, default_members)
         ckpt_dir = st.text_input("Checkpoint dir", value=str(cfg.paths.checkpoint_dir))
@@ -322,13 +323,13 @@ def main() -> None:
 
     ckpt_dir = Path(ckpt_dir)
     num_members = int(num_members)
-    water_best_names = [f"water_finetune_seed{s}_best.pt" for s in cfg.ensemble.seeds[:num_members]]
-    generator_checkpoint_names = water_best_names if model_set == "Water Best" else None
-    first_generator_checkpoint = (
-        ckpt_dir / water_best_names[0]
-        if model_set == "Water Best"
-        else ckpt_dir / f"generator_seed{cfg.ensemble.seeds[0]}.pt"
-    )
+    checkpoint_sets = {
+        "Agriculture": [f"seed{s}_latest.pt" for s in cfg.ensemble.seeds[:num_members]],
+        "Water Best": [f"water_finetune_seed{s}_best.pt" for s in cfg.ensemble.seeds[:num_members]],
+        "Marine Best": [f"water_marine_seed{s}_best.pt" for s in cfg.ensemble.seeds[:num_members]],
+    }
+    generator_checkpoint_names = checkpoint_sets[model_set]
+    first_generator_checkpoint = ckpt_dir / generator_checkpoint_names[0]
 
     st.markdown(
         f"""
@@ -376,16 +377,15 @@ def main() -> None:
     tmp = Path(f"/tmp/sar_dash{suffix}")
     tmp.write_bytes(raw)
 
-    if model_set == "Water Best":
-        missing = [name for name in water_best_names if not (ckpt_dir / name).exists()]
-        if missing:
-            st.markdown(
-                '<div class="warning-state">Missing Water Best generator checkpoint(s): '
-                + ", ".join(missing)
-                + '</div>',
-                unsafe_allow_html=True,
-            )
-            return
+    missing = [name for name in generator_checkpoint_names if not (ckpt_dir / name).exists()]
+    if missing:
+        st.markdown(
+            f'<div class="warning-state">Missing {model_set} generator checkpoint(s): '
+            + ", ".join(missing)
+            + '</div>',
+            unsafe_allow_html=True,
+        )
+        return
 
     with st.spinner("Running generator ensemble…"):
         sar = _load_sar(str(tmp), cfg).to(dev)  # (C, H, W) [-1,1]
