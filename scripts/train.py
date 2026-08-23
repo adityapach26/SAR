@@ -106,7 +106,7 @@ def save_checkpoint(cfg, epoch, gen, disc, opt_g, opt_d, path):
 def train_generator(seed, config, output_checkpoint_path, train_split=None,
                     init_checkpoint=None, lr=None, checkpoint_name=None,
                     batch_size=None, num_epochs=None, eval_split=None,
-                    best_checkpoint_path=None):
+                    best_checkpoint_path=None, reset_from_init=False):
     """Train a SAR-to-RGB generator and save its final weights.
 
     The extra parameters are all optional (None = current behavior) and let the
@@ -140,6 +140,9 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None,
         Optional Generator-only checkpoint path updated when held-out test L1
         improves. Used by water fine-tuning only; ``None`` preserves agriculture
         behavior.
+    reset_from_init : bool
+        If True, skip this run's latest-checkpoint resume and bootstrap from
+        ``init_checkpoint``. Default False preserves current resume behavior.
 
     Parameters
     ----------
@@ -254,7 +257,7 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None,
     base_name = checkpoint_name if checkpoint_name is not None else f"seed{seed}"
     latest_path = ckpt_dir / f"{base_name}_latest.pt"
     start_epoch = 1
-    if latest_path.exists():
+    if latest_path.exists() and not reset_from_init:
         try:
             _latest = torch.load(latest_path, map_location=device)
             start_epoch = int(_latest["epoch"]) + 1

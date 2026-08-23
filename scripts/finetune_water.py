@@ -147,6 +147,8 @@ def _parse_args():
     ap.add_argument("--output", default=None,
                     help="final generator weights path (default: "
                          "<checkpoint_dir>/water_finetune_seed{seed}.pt)")
+    ap.add_argument("--reset-from-agri", action="store_true",
+                    help="ignore water_finetune_seed{seed}_latest.pt and bootstrap from seed{seed}_latest.pt")
     ap.add_argument("--dry-run", action="store_true",
                     help="verify the pipeline WITHOUT training or writing anything")
     return ap.parse_args()
@@ -396,6 +398,7 @@ def main() -> int:
         num_epochs=args.epochs or int(cfg.finetune.num_epochs),
         eval_split=test_pairs,
         best_checkpoint_path=best_output,
+        reset_from_init=args.reset_from_agri,
     )
     print(f"\n[DONE] water-finetuned generator -> {output}  "
           f"(agriculture seed{seed}_latest.pt untouched)")
