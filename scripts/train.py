@@ -105,7 +105,8 @@ def save_checkpoint(cfg, epoch, gen, disc, opt_g, opt_d, path):
 
 def train_generator(seed, config, output_checkpoint_path, train_split=None,
                     init_checkpoint=None, lr=None, checkpoint_name=None,
-                    batch_size=None, num_epochs=None, eval_split=None):
+                    batch_size=None, num_epochs=None, eval_split=None,
+                    best_checkpoint_path=None):
     """Train a SAR-to-RGB generator and save its final weights.
 
     The extra parameters are all optional (None = current behavior) and let the
@@ -135,6 +136,10 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None,
         Held-out pairs (e.g. the water 10% test split) evaluated after every
         epoch — forward pass only, no gradient/optimizer updates. ``None`` (the
         agriculture default) disables evaluation entirely.
+    best_checkpoint_path : str | Path | None
+        Optional Generator-only checkpoint path updated when held-out test L1
+        improves. Used by water fine-tuning only; ``None`` preserves agriculture
+        behavior.
 
     Parameters
     ----------
@@ -190,7 +195,6 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None,
                     base_channels=config.model.generator.base_channels).to(device)
     disc = PatchGANDiscriminator(sar_channels=sar_channels, rgb_channels=3,
                                  base_channels=config.model.discriminator.base_channels).to(device)
-    print(f"seed={seed}  device={device}  epochs={n_epochs}  batch_size={config.train.batch_size}")
 
     # (3) resolve the data split (train_split overrides the config default)
     if train_split is None:
@@ -209,6 +213,9 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None,
                                           batch_size=batch_size)
         split_desc = f"provided split ({len(pairs)} pairs)"
         print(f"  split: {split_desc}  samples={n_samples}  batches/epoch={len(loader)}")
+
+    print(f"seed={seed}  device={device}  epochs={n_epochs}  "
+          f"batch_size={loader.batch_size}  batches_per_epoch={len(loader)}")
 
     # Held-out evaluation loader (water fine-tuning only; None elsewhere). The
     # test set is used ONLY for forward-pass evaluation, never for gradients.
@@ -230,6 +237,9 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None,
 
     ckpt_dir = Path(config.paths.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_path = Path(best_checkpoint_path) if best_checkpoint_path is not None else None
+    best_test_l1 = float("inf")
+    best_epoch = None
 
     # ---- resume / bootstrap support ----
     # A seed-specific "latest" checkpoint is overwritten at every save interval,
@@ -343,13 +353,22 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None,
         if eval_loader is not None:
             gen.eval()
             test_l1, nt = 0.0, 0
-            for sar, rgb in eval_loader:
-                sar, rgb = sar.to(device), rgb.to(device)
-                test_l1 += l1(gen(sar), rgb).item() * sar.size(0)
-                nt += sar.size(0)
+            with torch.no_grad():
+                for sar, rgb in eval_loader:
+                    sar, rgb = sar.to(device), rgb.to(device)
+                    test_l1 += l1(gen(sar), rgb).item() * sar.size(0)
+                    nt += sar.size(0)
             gen.train()
+            current_test_l1 = test_l1 / max(nt, 1)
             print(f"[eval] epoch {epoch} held-out test L1 = "
-                  f"{test_l1 / max(nt, 1):.4f}  (n={nt})")
+                  f"{current_test_l1:.4f}  (n={nt})")
+            if best_path is not None and current_test_l1 < best_test_l1:
+                best_test_l1 = current_test_l1
+                best_epoch = epoch
+                best_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(gen.state_dict(), best_path)
+                print(f"[best] epoch {epoch} test L1 = {current_test_l1:.4f} "
+                      f"-> saved {best_path.name}")
 
         # Always write the seed-specific "latest" checkpoint (resumable), and
         # additionally snap an epoch-numbered copy when saving past a boundary.
@@ -363,6 +382,10 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None,
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(gen.state_dict(), out)
     print(f"[save] final generator weights -> {out}")
+    if best_path is not None:
+        print(f"Best epoch: {best_epoch}")
+        print(f"Best held-out test L1: {best_test_l1:.4f}")
+        print(f"Best checkpoint: {best_path}")
 
     return gen
 

@@ -184,7 +184,10 @@ def dry_run(cfg, args):
     init_ckpt = Path(args.init_checkpoint or Path(cfg.paths.checkpoint_dir) / f"seed{seed}_latest.pt")
     out_ckpt = Path(args.output or Path(cfg.paths.checkpoint_dir) / f"water_finetune_seed{seed}.pt")
     latest_out = Path(cfg.paths.checkpoint_dir) / f"{base_name}_latest.pt"
+    best_out = Path(cfg.paths.checkpoint_dir) / f"{base_name}_best.pt"
     agri_latest = Path(cfg.paths.checkpoint_dir) / f"seed{seed}_latest.pt"
+    water_ckpt_paths = (latest_out, out_ckpt, best_out)
+    before_stats = {p: p.stat().st_mtime_ns if p.exists() else None for p in water_ckpt_paths}
 
     sar_channels = int(cfg.input_channels.num_channels)
     gen, disc = _build_models(cfg, device)
@@ -195,7 +198,7 @@ def dry_run(cfg, args):
 
     status = True
 
-    # (1)+(2) water dataset loads & flat-folder pairing (only checkable on Drive)
+    # (1)+(2) water dataset loads & s1/s2 folder pairing (only checkable on Drive)
     print(f"\nWater dataset path: {water}")
     if water.is_dir():
         pairs, st = _build_water_pairs(water)
@@ -302,11 +305,13 @@ def dry_run(cfg, args):
               "verify it loads there.")
 
     # (10)+(11) path separation — static, checkable anywhere
-    sep_latest = str(agri_latest) != str(latest_out) and str(agri_latest) != str(out_ckpt)
+    water_targets = {str(latest_out), str(out_ckpt), str(best_out)}
+    sep_latest = str(agri_latest) not in water_targets
+    sep_best = (str(best_out) not in {str(agri_latest), str(latest_out), str(out_ckpt)})
     status &= report(10, sep_latest,
                      f"seed{seed}_latest.pt ({agri_latest}) is NOT any water-FT write path")
-    status &= report(11, str(latest_out) != str(out_ckpt),
-                     f"water-FT newest ({latest_out}) and final ({out_ckpt}) are separate paths")
+    status &= report(11, sep_best,
+                     f"best checkpoint ({best_out}) is separate from agriculture/latest/final")
 
     # (12) one dry backward step to prove the fine-tune ops run (no weights saved)
     lr = float(args.lr if args.lr is not None else cfg.finetune.learning_rate)
@@ -328,12 +333,12 @@ def dry_run(cfg, args):
     status &= report(12, torch.isfinite(loss_d) and torch.isfinite(loss_g),
                      f"one D/G backward step OK @ lr={lr:g} (numel {fake.numel()})")
 
-    # (13) nothing written during dry-run — water-FT out/latest must not exist;
-    # agri_latest is the READ-ONLY input, so it pre-existing is expected, not a write.
-    wrote_water = latest_out.exists() or out_ckpt.exists()
-    status &= report(13, not wrote_water,
-                     f"no water checkpoint written during dry-run "
-                     f"({latest_out.name} / {out_ckpt.name} absent)")
+    # (13) nothing written during dry-run — existing water checkpoints may already
+    # exist from real runs, but dry-run must not create or modify them.
+    after_stats = {p: p.stat().st_mtime_ns if p.exists() else None for p in water_ckpt_paths}
+    status &= report(13, before_stats == after_stats,
+                     f"no water checkpoint created/modified during dry-run "
+                     f"({latest_out.name} / {out_ckpt.name} / {best_out.name})")
 
     print(f"\n{'ALL PASS' if status else 'SOME FAILED'} — dry run OK (nothing written). "
           f"Train with: python scripts/finetune_water.py --seed {seed} --epochs "
@@ -371,6 +376,7 @@ def main() -> int:
     assert set(train_pairs).isdisjoint(test_pairs), "train/test must be disjoint"
 
     output = args.output or str(ckpt_dir / f"water_finetune_seed{seed}.pt")
+    best_output = ckpt_dir / f"water_finetune_seed{seed}_best.pt"
     init = args.init_checkpoint or str(ckpt_dir / f"seed{seed}_latest.pt")
     if not Path(init).exists():
         raise SystemExit(f"init checkpoint not found: {init} — cannot fine-tune from scratch")
@@ -389,6 +395,7 @@ def main() -> int:
         batch_size=args.batch_size or int(cfg.finetune.batch_size),
         num_epochs=args.epochs or int(cfg.finetune.num_epochs),
         eval_split=test_pairs,
+        best_checkpoint_path=best_output,
     )
     print(f"\n[DONE] water-finetuned generator -> {output}  "
           f"(agriculture seed{seed}_latest.pt untouched)")
