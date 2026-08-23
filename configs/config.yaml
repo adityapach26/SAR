@@ -1,5 +1,9 @@
 dataset:
   path: "/content/drive/MyDrive/SAR_Project/dataset/v_2/agri"
+  # Water (ocean/coastal) dataset — same s1/s2 layout, used by the water
+  # fine-tuning entry point ONLY (scripts/finetune_water.py). Normal training
+  # keeps using 'path' above (agri).
+  water_path: "/content/drive/MyDrive/SAR_Project/dataset/v_2/water"
   local_dataset_path: "/content/local_dataset/agri"
   image_size: 256
   val_split: 0.1
@@ -36,6 +40,19 @@ loss:
   lambda_l1: 100.0
   lambda_perceptual: 10.0
   lambda_semantic: 1.0
+
+# Water-only fine-tuning schedule (agri -> water domain adaptation).
+# These are SEPARATE from the normal train.* settings, so existing agriculture
+# training (train.py) is untouched. batch_size 32 if the Colab GPU handles it,
+# else fall back to 16. Short, low-LR schedule by design.
+# split_seed is FIXED and independent of the model seed (1/2/3), so every
+# fine-tune run uses the SAME 90/10 water train/test split.
+finetune:
+  batch_size: 32
+  num_epochs: 10
+  learning_rate: 5e-5
+  test_split: 0.1
+  split_seed: 42
 
 ensemble:
   num_members: 3

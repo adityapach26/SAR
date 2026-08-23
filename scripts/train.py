@@ -58,14 +58,17 @@ def count_scenes(dataset_path: Path) -> int:
     return (max(indices) + 1) if indices else 0
 
 
-def _build_loader(cfg, pairs, shuffle=True):
-    """Wrap an explicit pair list in a parallel, pinned DataLoader."""
+def _build_loader(cfg, pairs, shuffle=True, batch_size=None):
+    """Wrap an explicit pair list in a parallel, pinned DataLoader.
+
+    ``batch_size`` overrides ``cfg.train.batch_size`` (used by fine-tuning).
+    """
     num_channels = cfg.input_channels.num_channels
     ds = SEN12Dataset(pairs, num_channels=num_channels,
                       texture_kernel_size=cfg.input_channels.texture_kernel_size)
     # Parallel background workers keep image loading off the GPU/math critical
     # path; pin_memory makes host->device copies faster on CUDA systems.
-    loader = DataLoader(ds, batch_size=cfg.train.batch_size, shuffle=shuffle,
+    loader = DataLoader(ds, batch_size=batch_size or cfg.train.batch_size, shuffle=shuffle,
                         num_workers=cfg.train.num_workers, pin_memory=True,
                         drop_last=False)
     return loader, len(ds)
@@ -100,8 +103,38 @@ def save_checkpoint(cfg, epoch, gen, disc, opt_g, opt_d, path):
     print(f"[save] checkpoint -> {path}")
 
 
-def train_generator(seed, config, output_checkpoint_path, train_split=None):
-    """Train a fresh SAR-to-RGB generator and save its final weights.
+def train_generator(seed, config, output_checkpoint_path, train_split=None,
+                    init_checkpoint=None, lr=None, checkpoint_name=None,
+                    batch_size=None, num_epochs=None, eval_split=None):
+    """Train a SAR-to-RGB generator and save its final weights.
+
+    The extra parameters are all optional (None = current behavior) and let the
+    water fine-tuning entry point (scripts/finetune_water.py) reuse this exact
+    training loop for a domain-adaptation run:
+
+    init_checkpoint : Path | None
+        A full checkpoint dict (``seed1_latest.pt``) whose Generator +
+        Discriminator weights are restored as a *starting point only*. Unlike
+        normal resume, the optimizers are NOT loaded — they are built fresh (at
+        the effective LR below), so fine-tuning starts from the trained weights
+        with a new, lower learning rate. This file is read-only, never written.
+    lr : float | None
+        Overrides ``config.train.learning_rate`` for the fresh optimizers.
+    checkpoint_name : str | None
+        Base name for this run's checkpoints. Defaults to ``seed{seed}``, giving
+        ``seed{seed}_latest.pt`` (resume) / ``seed{seed}_epoch_XXXX.pt``
+        (snapshots). Fine-tuning passes ``water_finetune_seed{seed}`` so it
+        writes ``water_finetune_seed{seed}_latest.pt`` and NEVER touches the
+        agriculture ``seed{seed}_latest.pt``. Resume also reads this name, so
+        fine-tuning resumes its OWN latest, not agriculture's.
+    batch_size : int | None
+        Overrides ``config.train.batch_size`` for the DataLoader.
+    num_epochs : int | None
+        Overrides ``config.train.num_epochs``.
+    eval_split : list[tuple[str, str]] | None
+        Held-out pairs (e.g. the water 10% test split) evaluated after every
+        epoch — forward pass only, no gradient/optimizer updates. ``None`` (the
+        agriculture default) disables evaluation entirely.
 
     Parameters
     ----------
@@ -134,12 +167,13 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
         The trained generator.
     """
     # PyYAML resolves the bare exponent "2e-4" to a string; coerce to float.
-    lr = float(config.train.learning_rate)
+    # ``lr``/``num_epochs``/``batch_size`` override the config (fine-tuning).
+    lr = float(lr if lr is not None else config.train.learning_rate)
     betas = (config.train.beta1, config.train.beta2)
     lambda_gan, lambda_l1 = config.loss.lambda_gan, config.loss.lambda_l1
     lambda_perc = config.loss.lambda_perceptual
     lambda_sem = config.loss.lambda_semantic
-    n_epochs = config.train.num_epochs
+    n_epochs = int(num_epochs if num_epochs is not None else config.train.num_epochs)
     log_every = config.train.log_every_n_batches
     save_every = config.train.save_every_n_epochs
 
@@ -171,9 +205,19 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
         print(f"  split: {split_desc}  samples={n_samples}  batches/epoch={len(loader)}")
     else:
         pairs = list(train_split)
-        loader, n_samples = _build_loader(config, pairs, shuffle=True)
+        loader, n_samples = _build_loader(config, pairs, shuffle=True,
+                                          batch_size=batch_size)
         split_desc = f"provided split ({len(pairs)} pairs)"
         print(f"  split: {split_desc}  samples={n_samples}  batches/epoch={len(loader)}")
+
+    # Held-out evaluation loader (water fine-tuning only; None elsewhere). The
+    # test set is used ONLY for forward-pass evaluation, never for gradients.
+    eval_loader = None
+    if eval_split is not None:
+        eval_loader, _ = _build_loader(config, list(eval_split), shuffle=False,
+                                       batch_size=batch_size)
+        print(f"  eval: {len(eval_split)} held-out pairs, "
+              f"{len(eval_loader)} batches (forward-only)")
 
     # Auxiliary losses are built only when enabled (heavy + frozen).
     perceptual = PerceptualLoss().to(device) if lambda_perc > 0 else None
@@ -187,12 +231,18 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
     ckpt_dir = Path(config.paths.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- resume support ----
+    # ---- resume / bootstrap support ----
     # A seed-specific "latest" checkpoint is overwritten at every save interval,
     # so a stopped/crashed run can pick up from the last saved epoch. Uses the
     # freshly-constructed models/optimizers, then overwrites them with the loaded
     # state dicts (correct arch + device via map_location).
-    latest_path = ckpt_dir / f"seed{seed}_latest.pt"
+    #
+    # checkpoint_name lets a fine-tuning run (scripts/finetune_water.py) use its
+    # OWN latest/snapshot prefix ("water_finetune_seed{seed}") instead of the
+    # agriculture "seed{seed}" — so it resumes its own latest and writes only
+    # water-named files, never touching seed{seed}_latest.pt.
+    base_name = checkpoint_name if checkpoint_name is not None else f"seed{seed}"
+    latest_path = ckpt_dir / f"{base_name}_latest.pt"
     start_epoch = 1
     if latest_path.exists():
         try:
@@ -207,6 +257,20 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
         except Exception as e:  # noqa: BLE001
             print(f"[resume] WARNING could not load {latest_path}: {e} -> starting fresh")
             start_epoch = 1
+    elif init_checkpoint is not None:
+        # Fine-tuning bootstrap: restore trained Generator + Discriminator
+        # weights as a starting point, but keep the FRESH optimizers (already
+        # built at the effective LR above) so fine-tuning runs with a new, lower
+        # learning rate. The init checkpoint is loaded READ-ONLY — it is never
+        # written back, and this run's checkpoints go to the water-named paths.
+        try:
+            _init = torch.load(init_checkpoint, map_location=device)
+            gen.load_state_dict(_init["generator_state_dict"])
+            disc.load_state_dict(_init["discriminator_state_dict"])
+            print(f"[init] bootstrapped G+D from {init_checkpoint} "
+                  f"(fresh optimizers @ lr={lr:g})")
+        except Exception as e:  # noqa: BLE001
+            print(f"[init] WARNING could not load {init_checkpoint}: {e} -> starting fresh")
     else:
         print(f"[resume] no checkpoint at {latest_path} -> FRESH start from epoch 1")
 
@@ -274,11 +338,24 @@ def train_generator(seed, config, output_checkpoint_path, train_split=None):
               f"perc {acc['g_perc'] / acc['n']:.4f} + sem {acc['g_sem'] / acc['n']:.4f}) "
               f"{time.time() - t0:.1f}s")
 
+        # Held-out test evaluation (forward-only, no weight updates) — reports the
+        # same L1 translation-loss convention used in training.
+        if eval_loader is not None:
+            gen.eval()
+            test_l1, nt = 0.0, 0
+            for sar, rgb in eval_loader:
+                sar, rgb = sar.to(device), rgb.to(device)
+                test_l1 += l1(gen(sar), rgb).item() * sar.size(0)
+                nt += sar.size(0)
+            gen.train()
+            print(f"[eval] epoch {epoch} held-out test L1 = "
+                  f"{test_l1 / max(nt, 1):.4f}  (n={nt})")
+
         # Always write the seed-specific "latest" checkpoint (resumable), and
         # additionally snap an epoch-numbered copy when saving past a boundary.
         if epoch % save_every == 0 or epoch == n_epochs:
             save_checkpoint(config, epoch, gen, disc, opt_g, opt_d, latest_path)
-            snapped = ckpt_dir / f"seed{seed}_epoch_{epoch:04d}.pt"
+            snapped = ckpt_dir / f"{base_name}_epoch_{epoch:04d}.pt"
             save_checkpoint(config, epoch, gen, disc, opt_g, opt_d, snapped)
 
     # Save the final generator weights to the requested path.
